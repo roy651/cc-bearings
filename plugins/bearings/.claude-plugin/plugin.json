@@ -1,0 +1,17 @@
+{
+  "name": "bearings",
+  "version": "0.1.0",
+  "description": "Keeps a glossary of the conversation's terms and a map of where the work stands, in panes opened from a band above the prompt, with a btw input for side questions.",
+  "author": {
+    "name": "Roy Abitbol"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "model": {
+      "type": "string",
+      "title": "Background model",
+      "description": "The model that updates the glossary and bearings after each turn: an alias (sonnet, haiku) or a model id.",
+      "default": "sonnet"
+    }
+  }
+}

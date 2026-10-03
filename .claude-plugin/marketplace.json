@@ -1,0 +1,14 @@
+{
+  "name": "cc-bearings",
+  "owner": {
+    "name": "Roy Abitbol"
+  },
+  "description": "Claude Code mods by Roy Abitbol.",
+  "plugins": [
+    {
+      "name": "bearings",
+      "source": "./plugins/bearings",
+      "description": "A glossary and a map of where the work stands, kept up in the background, for people who step away from a Claude Code session."
+    }
+  ]
+}

@@ -1,0 +1,277 @@
+import type { Bearings, Fact, GlossaryEntry, Pin, Source } from '../types'
+
+/** The two things the mod keeps, as one value the merge functions take and return. */
+export interface Snapshot {
+  glossary: GlossaryEntry[]
+  bearings: Bearings | null
+}
+
+/** What the background model answers: changes to apply, never the whole state. */
+export interface Delta {
+  glossary: {
+    upsert: { term: string; meaning: string }[]
+    seen: string[]
+  }
+  bearings: {
+    goal?: string
+    subGoals?: string[]
+    doneRecently?: string[]
+    inProgress?: string[]
+    expectedNext?: string[]
+    openDecisions?: string[]
+    factsAdd?: string[]
+    factsSeen?: string[]
+  }
+}
+
+const LIST_FIELDS = ['subGoals', 'doneRecently', 'inProgress', 'expectedNext', 'openDecisions'] as const
+
+export function emptyBearings(): Bearings {
+  return {
+    goal: '',
+    subGoals: [],
+    doneRecently: [],
+    inProgress: [],
+    expectedNext: [],
+    openDecisions: [],
+    facts: [],
+    updatedAtTurn: 0,
+  }
+}
+
+export function sameText(a: string, b: string): boolean {
+  return a.trim().toLowerCase() === b.trim().toLowerCase()
+}
+
+/** Pinned entries and entries a person or the main model added are never overwritten by the background model. */
+export function isProtected(entry: { pin: Pin; source: Source }): boolean {
+  return entry.pin !== 'none' || entry.source === 'operator' || entry.source === 'claude'
+}
+
+// ---------------------------------------------------------------------------
+// Parsing the model's reply
+
+/** Reads the model's reply into a Delta, or says why it cannot. */
+export function parseDelta(reply: string): Delta | { error: string } {
+  const json = extractJsonObject(reply)
+  if (json === null) return { error: 'the reply holds no JSON object' }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(json)
+  } catch (error) {
+    return { error: `the reply is not valid JSON (${(error as Error).message})` }
+  }
+  if (!isRecord(parsed)) return { error: 'the reply is not a JSON object' }
+
+  const glossary = parsed.glossary ?? {}
+  const bearings = parsed.bearings ?? {}
+  if (!isRecord(glossary)) return { error: '"glossary" is not an object' }
+  if (!isRecord(bearings)) return { error: '"bearings" is not an object' }
+
+  const upsert = glossary.upsert ?? []
+  if (!Array.isArray(upsert)) return { error: '"glossary.upsert" is not a list' }
+  const seen = readStringList(glossary.seen, 'glossary.seen')
+  if ('error' in seen) return seen
+
+  const delta: Delta = {
+    glossary: {
+      upsert: upsert.filter(isTermAndMeaning).map(item => ({ term: item.term.trim(), meaning: item.meaning.trim() })),
+      seen: seen.list,
+    },
+    bearings: {},
+  }
+
+  if (bearings.goal !== undefined) {
+    if (typeof bearings.goal !== 'string') return { error: '"bearings.goal" is not a string' }
+    delta.bearings.goal = bearings.goal
+  }
+  for (const field of [...LIST_FIELDS, 'factsAdd', 'factsSeen'] as const) {
+    if (bearings[field] === undefined) continue
+    const list = readStringList(bearings[field], `bearings.${field}`)
+    if ('error' in list) return list
+    delta.bearings[field] = list.list
+  }
+  return delta
+}
+
+/** Takes the JSON object out of a reply that may wrap it in a code fence or a sentence. */
+function extractJsonObject(reply: string): string | null {
+  const start = reply.indexOf('{')
+  const end = reply.lastIndexOf('}')
+  return start === -1 || end < start ? null : reply.slice(start, end + 1)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isTermAndMeaning(item: unknown): item is { term: string; meaning: string } {
+  return isRecord(item) && typeof item.term === 'string' && typeof item.meaning === 'string' && item.term.trim() !== ''
+}
+
+function readStringList(value: unknown, name: string): { list: string[] } | { error: string } {
+  if (value === undefined) return { list: [] }
+  if (!Array.isArray(value)) return { error: `"${name}" is not a list` }
+  return { list: value.filter((item): item is string => typeof item === 'string' && item.trim() !== '') }
+}
+
+// ---------------------------------------------------------------------------
+// Applying a delta
+
+export function applyDelta(snapshot: Snapshot, delta: Delta, turn: number): Snapshot {
+  return {
+    glossary: applyGlossaryDelta(snapshot.glossary, delta.glossary, turn),
+    bearings: applyBearingsDelta(snapshot.bearings ?? emptyBearings(), delta.bearings, turn),
+  }
+}
+
+function applyGlossaryDelta(entries: GlossaryEntry[], delta: Delta['glossary'], turn: number): GlossaryEntry[] {
+  let result = entries.map(entry => ({ ...entry }))
+
+  for (const { term, meaning } of delta.upsert) {
+    const existing = result.find(entry => sameText(entry.term, term))
+    if (existing === undefined) {
+      result = [...result, { term, meaning, firstTurn: turn, lastSeenTurn: turn, pin: 'none', source: 'auto' }]
+      continue
+    }
+    existing.lastSeenTurn = turn
+    if (!isProtected(existing)) {
+      existing.meaning = meaning
+      existing.source = 'auto'
+    }
+  }
+
+  for (const term of delta.seen) {
+    const existing = result.find(entry => sameText(entry.term, term))
+    if (existing !== undefined) existing.lastSeenTurn = turn
+  }
+  return result
+}
+
+function applyBearingsDelta(current: Bearings, delta: Delta['bearings'], turn: number): Bearings {
+  const next: Bearings = { ...current, facts: current.facts.map(fact => ({ ...fact })), updatedAtTurn: turn }
+  // Once this session has updated the map, it no longer reads as another session's.
+  delete next.inheritedFrom
+
+  if (delta.goal !== undefined) next.goal = delta.goal
+  for (const field of LIST_FIELDS) {
+    const list = delta[field]
+    if (list !== undefined) next[field] = list
+  }
+
+  for (const text of delta.factsAdd ?? []) {
+    next.facts = addOrTouchFact(next.facts, text, 'auto', turn)
+  }
+  for (const text of delta.factsSeen ?? []) {
+    const existing = next.facts.find(fact => sameText(fact.text, text))
+    if (existing !== undefined) existing.lastSeenTurn = turn
+  }
+  return next
+}
+
+function addOrTouchFact(facts: Fact[], text: string, source: Source, turn: number): Fact[] {
+  const existing = facts.find(fact => sameText(fact.text, text))
+  if (existing === undefined) return [...facts, { text: text.trim(), lastSeenTurn: turn, pin: 'none', source }]
+  return facts.map(fact => (fact === existing ? { ...fact, lastSeenTurn: turn } : fact))
+}
+
+// ---------------------------------------------------------------------------
+// Rebuild: regenerate from the transcript, keeping what a person protected
+
+/** What a rebuild starts from: only the pinned and hand-added entries; everything automatic is regenerated. */
+export function protectedOnly(snapshot: Snapshot): Snapshot {
+  return {
+    glossary: snapshot.glossary.filter(isProtected),
+    bearings: { ...emptyBearings(), facts: (snapshot.bearings?.facts ?? []).filter(isProtected) },
+  }
+}
+
+/** After a rebuild, a term known before keeps the turn it was first seen in. */
+export function restoreFirstTurns(before: Snapshot, rebuilt: Snapshot): Snapshot {
+  const firstTurnOf = (term: string) => before.glossary.find(entry => sameText(entry.term, term))?.firstTurn
+  return {
+    ...rebuilt,
+    glossary: rebuilt.glossary.map(entry => ({ ...entry, firstTurn: firstTurnOf(entry.term) ?? entry.firstTurn })),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Additions and pins made by a person (pane input) or the main model (tool)
+
+/** Adds a term, or replaces its meaning: an explicit add wins over whatever was there. */
+export function addTerm(snapshot: Snapshot, term: string, meaning: string, source: Source, turn: number): Snapshot {
+  const existing = snapshot.glossary.find(entry => sameText(entry.term, term))
+  const glossary = existing === undefined
+    ? [...snapshot.glossary, { term: term.trim(), meaning: meaning.trim(), firstTurn: turn, lastSeenTurn: turn, pin: 'none' as Pin, source }]
+    : snapshot.glossary.map(entry => (entry === existing ? { ...entry, meaning: meaning.trim(), lastSeenTurn: turn, source } : entry))
+  return { ...snapshot, glossary }
+}
+
+export function addFact(snapshot: Snapshot, text: string, source: Source, turn: number): Snapshot {
+  const bearings = snapshot.bearings ?? emptyBearings()
+  const existing = bearings.facts.find(fact => sameText(fact.text, text))
+  const facts = existing === undefined
+    ? [...bearings.facts, { text: text.trim(), lastSeenTurn: turn, pin: 'none' as Pin, source }]
+    : bearings.facts.map(fact => (fact === existing ? { ...fact, lastSeenTurn: turn, source } : fact))
+  return { ...snapshot, bearings: { ...bearings, facts } }
+}
+
+/**
+ * Sets the pin of the glossary term named `target`, or else of the fact whose text
+ * starts with it. Says which kind it matched, or null when nothing did.
+ */
+export function setPin(snapshot: Snapshot, target: string, pin: Pin): { snapshot: Snapshot; matched: 'term' | 'fact' | null } {
+  const term = snapshot.glossary.find(entry => sameText(entry.term, target))
+  if (term !== undefined) {
+    const glossary = snapshot.glossary.map(entry => (entry === term ? { ...entry, pin } : entry))
+    return { snapshot: { ...snapshot, glossary }, matched: 'term' }
+  }
+
+  const bearings = snapshot.bearings
+  const wanted = target.trim().toLowerCase()
+  const fact = bearings?.facts.find(one => one.text.toLowerCase().startsWith(wanted))
+  if (bearings === null || fact === undefined) return { snapshot, matched: null }
+
+  const facts = bearings.facts.map(one => (one === fact ? { ...one, pin } : one))
+  return { snapshot: { ...snapshot, bearings: { ...bearings, facts } }, matched: 'fact' }
+}
+
+// ---------------------------------------------------------------------------
+// Project pins: kept in the store per working directory, loaded into every session there
+
+export interface ProjectPins {
+  glossary: GlossaryEntry[]
+  facts: Fact[]
+}
+
+/** The store key of one working directory's project pins. */
+export function projectPinsKey(cwd: string): string {
+  return `project-pins:${cwd}`
+}
+
+export function projectPinsOf(snapshot: Snapshot): ProjectPins {
+  return {
+    glossary: snapshot.glossary.filter(entry => entry.pin === 'project'),
+    facts: (snapshot.bearings?.facts ?? []).filter(fact => fact.pin === 'project'),
+  }
+}
+
+/** Lays the stored project pins over a snapshot: the stored meaning and text win. */
+export function mergeProjectPins(snapshot: Snapshot, pins: ProjectPins): Snapshot {
+  let glossary = snapshot.glossary
+  for (const pinned of pins.glossary) {
+    const others = glossary.filter(entry => !sameText(entry.term, pinned.term))
+    glossary = [...others, { ...pinned, pin: 'project' }]
+  }
+
+  if (snapshot.bearings === null && pins.facts.length === 0) return { glossary, bearings: null }
+
+  const bearings = snapshot.bearings ?? emptyBearings()
+  let facts = bearings.facts
+  for (const pinned of pins.facts) {
+    const others = facts.filter(fact => !sameText(fact.text, pinned.text))
+    facts = [...others, { ...pinned, pin: 'project' }]
+  }
+  return { glossary, bearings: { ...bearings, facts } }
+}

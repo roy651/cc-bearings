@@ -1,0 +1,106 @@
+import type { Bearings, Fact, GlossaryEntry } from '../types'
+import type { Snapshot } from './merge'
+
+/** A Markdown element draws at most 10000 characters; stay under it with room for the cut note. */
+export const MARKDOWN_LIMIT = 9500
+
+export function capText(text: string, limit: number): string {
+  if (text.length <= limit) return text
+  return `${text.slice(0, limit)}\n\n... (cut at ${limit} characters)`
+}
+
+function pinMark(pin: GlossaryEntry['pin']): string {
+  if (pin === 'session') return ' [pinned]'
+  if (pin === 'project') return ' [project pin]'
+  return ''
+}
+
+export function glossaryLine(entry: GlossaryEntry): string {
+  const when = entry.source === 'inherited' ? 'earlier session' : `T${entry.firstTurn}`
+  return `- **${entry.term}**: ${entry.meaning} (${when})${pinMark(entry.pin)}`
+}
+
+export function glossaryList(entries: GlossaryEntry[]): string {
+  const newestFirst = [...entries].sort((a, b) => b.lastSeenTurn - a.lastSeenTurn)
+  return newestFirst.map(glossaryLine).join('\n')
+}
+
+function bulletList(items: string[]): string {
+  return items.length === 0 ? '_none_' : items.map(item => `- ${item}`).join('\n')
+}
+
+export function factList(facts: Fact[]): string {
+  return facts.length === 0 ? '_none_' : facts.map(fact => `- ${fact.text}${pinMark(fact.pin)}`).join('\n')
+}
+
+/** The Bearings sections in the order of the Bearings shape, with the facts given separately (recent ones in the pane). */
+export function bearingsSections(bearings: Bearings, facts: Fact[]): string {
+  return [
+    `## Goal\n${bearings.goal || '_not stated yet_'}`,
+    `## Sub-goals\n${bulletList(bearings.subGoals)}`,
+    `## Done recently\n${bulletList(bearings.doneRecently)}`,
+    `## In progress\n${bulletList(bearings.inProgress)}`,
+    `## Expected next\n${bulletList(bearings.expectedNext)}`,
+    `## Open decisions\n${bulletList(bearings.openDecisions)}`,
+    `## Facts to hold\n${factList(facts)}`,
+  ].join('\n\n')
+}
+
+/** The Bearings half of the session's .md file. */
+export function bearingsFileSection(snapshot: Snapshot): string {
+  const bearings = snapshot.bearings
+  return `# Bearings\n\n${bearings === null ? '_No bearings yet._' : bearingsSections(bearings, bearings.facts)}\n`
+}
+
+/** The Glossary half of the session's .md file. */
+export function glossaryFileSection(snapshot: Snapshot): string {
+  return `# Glossary\n\n${snapshot.glossary.length === 0 ? '_No terms yet._' : glossaryList(snapshot.glossary)}\n`
+}
+
+/** The readable file and the text handed to the model: Bearings first, then the whole Glossary. */
+export function snapshotMarkdown(snapshot: Snapshot): string {
+  return `${bearingsFileSection(snapshot)}\n${glossaryFileSection(snapshot)}`
+}
+
+export function viewSection(view: 'glossary' | 'bearings', snapshot: Snapshot): string {
+  return view === 'glossary' ? glossaryFileSection(snapshot) : bearingsFileSection(snapshot)
+}
+
+/** What `/glossary print` answers: the model reads it, so it stays about ten tokens. */
+export function printStub(view: 'glossary' | 'bearings', n: number): string {
+  return `${view === 'glossary' ? 'Glossary' : 'Bearings'} view #${n} shown to the person (not in the conversation).`
+}
+
+/** The print number a command's output row names, or null when it names none. */
+export function printNumberOf(rowText: string): number | null {
+  const found = /#(\d+)/.exec(rowText)
+  return found === null ? null : Number(found[1])
+}
+
+/** A print as its output row draws it: cut to fit one Markdown element, the .md path as the last line. */
+export function printDrawing(markdown: string, markdownPath: string | null): string {
+  const footer = markdownPath === null ? '' : `\n\n_Full file: ${markdownPath}_`
+  const cutNoteRoom = 60
+  return capText(markdown, MARKDOWN_LIMIT - footer.length - cutNoteRoom) + footer
+}
+
+/** The single log line in VS Code when the .md cannot be opened, cut at about this length. */
+export const PRINTED_VIEW_LIMIT = 8000
+
+/** The text of a printed view: the view's part of the .md file, cut with a last line naming the file. */
+export function printedView(view: 'glossary' | 'bearings', snapshot: Snapshot, markdownPath: string | null): string {
+  const text = viewSection(view, snapshot)
+  if (text.length <= PRINTED_VIEW_LIMIT) return text
+  const where = markdownPath ?? "this session's .md file"
+  return `${text.slice(0, PRINTED_VIEW_LIMIT)}\n\n... cut at ${PRINTED_VIEW_LIMIT} characters. The rest is in ${where}`
+}
+
+/** "3 minutes ago" style, coarse on purpose: the header only needs a rough age. */
+export function relativeTime(thenMs: number, nowMs: number): string {
+  const minutes = Math.round((nowMs - thenMs) / 60000)
+  if (minutes < 1) return 'just now'
+  if (minutes < 60) return `${minutes} min ago`
+  const hours = Math.round(minutes / 60)
+  if (hours < 48) return `${hours} h ago`
+  return `${Math.round(hours / 24)} days ago`
+}

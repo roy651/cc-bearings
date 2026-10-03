@@ -1,0 +1,113 @@
+import { describe, expect, test } from 'claude-code/testing'
+
+import type { GlossaryEntry } from '../types'
+import { applyDelta, emptyBearings, parseDelta, protectedOnly, restoreFirstTurns } from '../hooks/merge'
+import type { Delta, Snapshot } from '../hooks/merge'
+
+function entry(term: string, meaning: string, extra: Partial<GlossaryEntry> = {}): GlossaryEntry {
+  return { term, meaning, firstTurn: 1, lastSeenTurn: 1, pin: 'none', source: 'auto', ...extra }
+}
+
+function delta(glossary: Partial<Delta['glossary']>, bearings: Delta['bearings'] = {}): Delta {
+  return { glossary: { upsert: [], seen: [], ...glossary }, bearings }
+}
+
+describe('applyDelta glossary', () => {
+  test('upsert adds a new term first seen at this turn', () => {
+    const result = applyDelta({ glossary: [], bearings: null }, delta({ upsert: [{ term: 'FMA', meaning: 'failure mechanism analyzer' }] }), 4)
+    expect(result.glossary).toEqual([entry('FMA', 'failure mechanism analyzer', { firstTurn: 4, lastSeenTurn: 4 })])
+  })
+
+  test('upsert replaces an automatic meaning and keeps the first turn', () => {
+    const before: Snapshot = { glossary: [entry('FMA', 'old meaning')], bearings: null }
+    const result = applyDelta(before, delta({ upsert: [{ term: 'fma', meaning: 'new meaning' }] }), 7)
+    expect(result.glossary[0]).toEqual(entry('FMA', 'new meaning', { firstTurn: 1, lastSeenTurn: 7 }))
+  })
+
+  test('seen moves lastSeenTurn and nothing else', () => {
+    const before: Snapshot = { glossary: [entry('BME', 'behavioral model extractor')], bearings: null }
+    const result = applyDelta(before, delta({ seen: ['BME'] }), 9)
+    expect(result.glossary[0]).toEqual(entry('BME', 'behavioral model extractor', { lastSeenTurn: 9 }))
+  })
+
+  test('a pinned entry keeps its meaning against an automatic upsert, but counts as seen', () => {
+    const before: Snapshot = { glossary: [entry('REC', 'recommendation', { pin: 'session' })], bearings: null }
+    const result = applyDelta(before, delta({ upsert: [{ term: 'REC', meaning: 'something invented' }] }), 5)
+    expect(result.glossary[0]?.meaning).toBe('recommendation')
+    expect(result.glossary[0]?.lastSeenTurn).toBe(5)
+  })
+
+  test('entries the operator or the main model added keep their meaning', () => {
+    const before: Snapshot = {
+      glossary: [entry('A', 'from operator', { source: 'operator' }), entry('B', 'from claude', { source: 'claude' })],
+      bearings: null,
+    }
+    const result = applyDelta(before, delta({ upsert: [{ term: 'A', meaning: 'x' }, { term: 'B', meaning: 'y' }] }), 3)
+    expect(result.glossary.map(one => one.meaning)).toEqual(['from operator', 'from claude'])
+  })
+
+  test('the input snapshot is not changed', () => {
+    const before: Snapshot = { glossary: [entry('FMA', 'old')], bearings: null }
+    applyDelta(before, delta({ upsert: [{ term: 'FMA', meaning: 'new' }] }), 2)
+    expect(before.glossary[0]?.meaning).toBe('old')
+  })
+})
+
+describe('applyDelta bearings', () => {
+  test('only the fields the delta names change', () => {
+    const before: Snapshot = { glossary: [], bearings: { ...emptyBearings(), goal: 'ship it', inProgress: ['tests'] } }
+    const result = applyDelta(before, delta({}, { inProgress: ['review'] }), 6)
+    expect(result.bearings?.goal).toBe('ship it')
+    expect(result.bearings?.inProgress).toEqual(['review'])
+    expect(result.bearings?.updatedAtTurn).toBe(6)
+  })
+
+  test('factsAdd adds once, factsSeen touches', () => {
+    const before: Snapshot = { glossary: [], bearings: emptyBearings() }
+    const first = applyDelta(before, delta({}, { factsAdd: ['Temperature is 0.1', 'temperature is 0.1'] }), 2)
+    expect(first.bearings?.facts.length).toBe(1)
+    const second = applyDelta(first, delta({}, { factsSeen: ['Temperature is 0.1'] }), 8)
+    expect(second.bearings?.facts[0]?.lastSeenTurn).toBe(8)
+  })
+
+  test('the inherited header goes once this session updates', () => {
+    const before: Snapshot = { glossary: [], bearings: { ...emptyBearings(), inheritedFrom: { sessionId: 'abc', savedAt: '2026-10-01T00:00:00.000Z' } } }
+    expect(applyDelta(before, delta({}), 1).bearings?.inheritedFrom).toBeUndefined()
+  })
+})
+
+describe('parseDelta', () => {
+  test('reads a delta wrapped in a code fence', () => {
+    const parsed = parseDelta('```json\n{"glossary":{"upsert":[{"term":"X","meaning":"y"}],"seen":[]},"bearings":{"goal":"g"}}\n```')
+    expect(parsed).toEqual(delta({ upsert: [{ term: 'X', meaning: 'y' }] }, { goal: 'g' }))
+  })
+
+  test('says why a reply is not a delta', () => {
+    expect('error' in parseDelta('no json here')).toBe(true)
+    expect('error' in parseDelta('{"glossary": {"upsert": "nope"}}')).toBe(true)
+    expect('error' in parseDelta('{"bearings": {"subGoals": "one"}}')).toBe(true)
+  })
+})
+
+describe('rebuild helpers', () => {
+  test('a rebuild starts from the pinned and hand-added entries only, and known terms keep their first turn', () => {
+    const before: Snapshot = {
+      glossary: [
+        entry('OLD', 'stale', { firstTurn: 2 }),
+        entry('KEEP', 'pinned meaning', { pin: 'project' }),
+        entry('MINE', 'operator meaning', { source: 'operator' }),
+        entry('SAME', 'known term', { firstTurn: 3 }),
+      ],
+      bearings: { ...emptyBearings(), goal: 'old goal', facts: [{ text: 'kept fact', lastSeenTurn: 1, pin: 'session', source: 'auto' }, { text: 'dropped fact', lastSeenTurn: 1, pin: 'none', source: 'auto' }] },
+    }
+    const start = protectedOnly(before)
+    expect(start.glossary.map(one => one.term)).toEqual(['KEEP', 'MINE'])
+    expect(start.bearings?.goal).toBe('')
+    expect(start.bearings?.facts.map(one => one.text)).toEqual(['kept fact'])
+
+    const rebuilt = applyDelta(start, delta({ upsert: [{ term: 'SAME', meaning: 'fresh' }, { term: 'KEEP', meaning: 'overwrite attempt' }] }), 20)
+    const result = restoreFirstTurns(before, rebuilt)
+    expect(result.glossary.find(one => one.term === 'SAME')?.firstTurn).toBe(3)
+    expect(result.glossary.find(one => one.term === 'KEEP')?.meaning).toBe('pinned meaning')
+  })
+})

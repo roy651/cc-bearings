@@ -1,0 +1,4 @@
+# Written by Claude Code at each load of the plugin
+plugins/bearings/.claude-plugin/types/
+plugins/bearings/tsconfig.json
+.DS_Store

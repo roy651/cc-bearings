@@ -1,0 +1,694 @@
+import { atom, read, update } from 'claude-code'
+import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
+
+import type {
+  Bearings, BtwExchange, GlossaryEntry, Participation, PendingPrompt, PrintedView, SessionSummary, UpdateStats,
+} from '../types'
+import { applyPaneCommand, applyToolAdd, COMMAND_HELP, parsePaneCommand } from './commands'
+import type { ToolAddInput } from './commands'
+import {
+  bearingsSections, capText, factList, glossaryList, MARKDOWN_LIMIT, printDrawing, printedView, printNumberOf, printStub,
+  relativeTime, snapshotMarkdown, viewSection,
+} from './markdown'
+import { emptyBearings, mergeProjectPins, projectPinsKey, projectPinsOf, protectedOnly, restoreFirstTurns } from './merge'
+import type { ProjectPins, Snapshot } from './merge'
+import { bearingsFolder, firstLine, readSessionFiles, saveSession } from './persist'
+import type { FileAccess, SavedSession } from './persist'
+import {
+  BTW_FALLBACK_MARK, BTW_FALLBACK_MESSAGES, btwFallbackPrompt, btwPrompt, rebuildChunkPrompt, transcriptChunks,
+  updatePrompt, UPDATE_SYSTEM,
+} from './prompts'
+import type { TranscriptMessage, TurnText } from './prompts'
+import { createSerialQueue } from './queue'
+import { isNew, splitByRecency } from './retention'
+import {
+  activeOthers, coldStartNote, compactionNote, inheritedBearings, mergeGlossaries, seedGlossary,
+  sessionSections, shortId, summarize,
+} from './sessions'
+import { addUsage, applyUpdateReply, describeFailure, emptyStats } from './update'
+import type { ReplyOutcome } from './update'
+
+// The engine checks that `$` is only passed to functions declared at the top of
+// this file and that state atoms are declared here too, so everything that talks
+// to the engine lives here; the logic it calls is in the sibling modules, which
+// are plain functions.
+
+const DEFAULT_MODEL = 'sonnet'
+const GLOSSARY_PANE = 'bearings-glossary'
+const BEARINGS_PANE = 'bearings-map'
+
+const BTW_KEPT = 20
+const PRINTS_KEPT = 20
+/** How often the folder listing is re-read to see the other sessions here. */
+const OTHER_SESSIONS_POLL_MS = 60_000
+
+// Session state, declared in PluginState (types/index.d.ts).
+const glossaryAtom = atom({ plugin: 'bearings', key: 'glossary' } as const, [] as GlossaryEntry[])
+const bearingsAtom = atom({ plugin: 'bearings', key: 'bearings' } as const, null as Bearings | null)
+const turnAtom = atom({ plugin: 'bearings', key: 'turn' } as const, 0)
+const btwAtom = atom({ plugin: 'bearings', key: 'btw' } as const, [] as BtwExchange[])
+const statsAtom = atom({ plugin: 'bearings', key: 'stats' } as const, emptyStats() as UpdateStats)
+const pendingPromptAtom = atom({ plugin: 'bearings', key: 'pendingPrompt' } as const, null as PendingPrompt | null)
+const isUpdatingAtom = atom({ plugin: 'bearings', key: 'isUpdating' } as const, false)
+const rebuildProgressAtom = atom({ plugin: 'bearings', key: 'rebuildProgress' } as const, null as { done: number; total: number } | null)
+const btwPendingQuestionAtom = atom({ plugin: 'bearings', key: 'btwPendingQuestion' } as const, null as string | null)
+const btwNoticeAtom = atom({ plugin: 'bearings', key: 'btwNotice' } as const, null as string | null)
+const isGlossaryEarlierOpenAtom = atom({ plugin: 'bearings', key: 'isGlossaryEarlierOpen' } as const, false)
+const isBearingsEarlierOpenAtom = atom({ plugin: 'bearings', key: 'isBearingsEarlierOpen' } as const, false)
+const otherSessionsAtom = atom({ plugin: 'bearings', key: 'otherSessions' } as const, [] as SessionSummary[])
+const isOtherSessionsOpenAtom = atom({ plugin: 'bearings', key: 'isOtherSessionsOpen' } as const, false)
+const participationAtom = atom({ plugin: 'bearings', key: 'participation' } as const, 'unknown' as Participation)
+const printsAtom = atom({ plugin: 'bearings', key: 'prints' } as const, [] as PrintedView[])
+
+// Turns that finish while an update runs are folded into the next single call.
+const updates = createSerialQueue<TurnText>()
+
+// A hot reload drops the module's timers and resets this flag, so the next turn starts the poll again.
+let isPollingOtherSessions = false
+
+const ADD_TOOL_DESCRIPTION =
+  'Adds a term with its meaning, or a fact, to the Bearings glossary and map the operator reads in a side pane. ' +
+  'Call it only when the operator asks you to add, note or pin something there. ' +
+  'Give "term" and "meaning", or "fact". "pin": "session" keeps it in view all session, ' +
+  '"project" keeps it in every session in this folder.'
+
+const ADD_TOOL_SCHEMA = {
+  type: 'object',
+  properties: {
+    term: { type: 'string', description: 'The acronym, label, id or key term.' },
+    meaning: { type: 'string', description: 'One line, taken from the conversation.' },
+    fact: { type: 'string', description: 'A fact to hold, in one short sentence.' },
+    pin: { type: 'string', enum: ['none', 'session', 'project'] },
+  },
+}
+
+// -------------------------------------------------------------------------
+// State: the glossary and bearings as one snapshot, the files, the project pins
+
+async function readSnapshot($: EngineInterface): Promise<Snapshot> {
+  return { glossary: await read($, glossaryAtom), bearings: await read($, bearingsAtom) }
+}
+
+/** Reads both values, applies `change`, writes both. Slow work (model calls) happens before, so the read is fresh. */
+async function changeSnapshot($: EngineInterface, change: (snapshot: Snapshot) => Snapshot): Promise<void> {
+  const next = change(await readSnapshot($))
+  await update($, glossaryAtom, () => next.glossary)
+  await update($, bearingsAtom, () => next.bearings)
+}
+
+async function hasContent($: EngineInterface): Promise<boolean> {
+  const snapshot = await readSnapshot($)
+  return snapshot.bearings !== null || snapshot.glossary.length > 0
+}
+
+async function readProjectPins($: EngineInterface, cwd: string): Promise<ProjectPins> {
+  const stored = (await $.store.get(projectPinsKey(cwd))) as ProjectPins | undefined
+  return stored ?? { glossary: [], facts: [] }
+}
+
+/** Keeps the store's project pins equal to the entries pinned `project` now. */
+async function syncProjectPins($: EngineInterface): Promise<void> {
+  const cwd = await $.session.cwd()
+  await $.store.set(projectPinsKey(cwd), projectPinsOf(await readSnapshot($)))
+}
+
+/** This working directory's session-file folder and a way to reach it, or null where HOME is unset. */
+async function sessionFolder($: EngineInterface, cwd: string): Promise<{ folder: string; files: FileAccess } | null> {
+  const home = await $.env.get('HOME')
+  if (home === undefined || home === '') return null
+  const files: FileAccess = {
+    read: path => $.fs.read(path),
+    write: (path, text) => $.fs.write(path, text),
+    list: path => $.fs.list(path),
+  }
+  return { folder: bearingsFolder(home, cwd), files }
+}
+
+/** Writes `<session id>.json` and `<session id>.md`. A failed write is logged, never thrown. */
+async function saveFiles($: EngineInterface): Promise<void> {
+  const place = await sessionFolder($, await $.session.cwd())
+  if (place === null) return
+
+  const snapshot = await readSnapshot($)
+  const saved: SavedSession = {
+    sessionId: await $.session.id(),
+    cwd: await $.session.cwd(),
+    startedAt: new Date((await $.session.usage()).startedAt).toISOString(),
+    lastTouched: new Date(await $.clock.now()).toISOString(),
+    goal: firstLine(snapshot.bearings?.goal ?? ''),
+    turn: await read($, turnAtom),
+    glossary: snapshot.glossary,
+    bearings: snapshot.bearings,
+    btw: await read($, btwAtom),
+    stats: await read($, statsAtom),
+  }
+  try {
+    await saveSession(place.files, place.folder, saved, snapshotMarkdown(snapshot))
+  } catch (error) {
+    $.ui.log(`could not write ${place.folder}: ${(error as Error).message}`)
+  }
+}
+
+/** Adds one user row the model reads and the person does not see as typed. */
+async function appendNote($: EngineInterface, text: string): Promise<void> {
+  await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
+}
+
+/** Non-interactive runs (-p, the SDK, a fixer) take no part: every hook passes through. */
+async function isOff($: EngineInterface): Promise<boolean> {
+  return (await read($, participationAtom)) === 'off'
+}
+
+// -------------------------------------------------------------------------
+// Other sessions in this folder
+
+/** Every session file in this folder, this session's own included, or none where HOME is unset. */
+async function readFolderSessions($: EngineInterface, cwd: string): Promise<SavedSession[]> {
+  const place = await sessionFolder($, cwd)
+  return place === null ? [] : readSessionFiles(place.files, place.folder)
+}
+
+async function readOtherActiveSessions($: EngineInterface): Promise<SavedSession[]> {
+  const sessions = await readFolderSessions($, await $.session.cwd())
+  return activeOthers(sessions, await $.session.id(), await $.clock.now())
+}
+
+async function refreshOtherSessions($: EngineInterface): Promise<void> {
+  try {
+    const others = (await readOtherActiveSessions($)).map(summarize)
+    await update($, otherSessionsAtom, () => others)
+  } catch (error) {
+    $.ui.log(`could not read the other sessions (${(error as Error).message})`, { to: 'debug' })
+  }
+}
+
+/** Reads the folder now, then once a minute. Started at most once per module load. */
+function ensureOtherSessionsPoll($: EngineInterface): void {
+  if (isPollingOtherSessions) return
+  isPollingOtherSessions = true
+  void refreshOtherSessions($)
+  $.clock.every(OTHER_SESSIONS_POLL_MS, () => void refreshOtherSessions($))
+}
+
+// -------------------------------------------------------------------------
+// Session start
+
+/**
+ * When this session holds nothing yet: restores this session's own file (a resume), or else
+ * seeds the glossary with the union of the other sessions active in this folder and tells the
+ * model about them in one row (nothing when none is active). Then lays the project pins on top.
+ */
+async function coldStart($: EngineInterface, cwd: string): Promise<void> {
+  if (await hasContent($)) return
+
+  const sessionId = await $.session.id()
+  const sessions = await readFolderSessions($, cwd)
+  const own = sessions.find(session => session.sessionId === sessionId)
+  const others = activeOthers(sessions, sessionId, await $.clock.now())
+
+  if (own !== undefined) {
+    await changeSnapshot($, () => ({ glossary: own.glossary, bearings: own.bearings }))
+    await update($, turnAtom, () => own.turn)
+    await update($, btwAtom, () => own.btw)
+    await update($, statsAtom, () => own.stats)
+  } else if (others.length > 0) {
+    const seeded = seedGlossary(mergeGlossaries(others))
+    await changeSnapshot($, () => ({ glossary: seeded, bearings: inheritedBearings(others[0]!, emptyBearings()) }))
+  }
+
+  const pins = await readProjectPins($, cwd)
+  await changeSnapshot($, snapshot => mergeProjectPins(snapshot, pins))
+
+  const note = own === undefined ? coldStartNote(others, await $.clock.now()) : null
+  if (note !== null) await appendNote($, note)
+}
+
+// -------------------------------------------------------------------------
+// The three model calls: background update, rebuild, btw
+
+async function runUpdate($: EngineInterface, model: string, turns: TurnText[]): Promise<void> {
+  const latestTurn = turns[turns.length - 1]?.turn ?? 0
+  await update($, isUpdatingAtom, () => true)
+  try {
+    const reply = await $.model.complete({
+      model,
+      system: UPDATE_SYSTEM,
+      prompt: updatePrompt(await readSnapshot($), turns),
+      maxTokens: 4000,
+    })
+    await applyOutcome($, 'update', (snapshot, stats) => applyUpdateReply(snapshot, stats, reply, latestTurn))
+  } finally {
+    await update($, isUpdatingAtom, () => false)
+  }
+}
+
+/** The transcript as the rebuild and the btw fallback read it: each message's role and text, no tool calls. */
+async function readTranscript($: EngineInterface): Promise<TranscriptMessage[]> {
+  return (await $.session.messages()).map(message => ({ role: message.role, text: message.text }))
+}
+
+/**
+ * Regenerates the glossary and bearings from the whole transcript, not a fork (a resumed
+ * process has nothing to fork until its first request). The transcript goes through the
+ * background update's path in chunks, in order, each call taking the state so far. It starts
+ * from the pinned and hand-added entries only, and nothing changes unless every chunk applies.
+ */
+async function rebuild($: EngineInterface, model: string): Promise<void> {
+  if ((await read($, rebuildProgressAtom)) !== null) return
+
+  const chunks = transcriptChunks(await readTranscript($))
+  if (chunks.length === 0) {
+    $.ui.log('rebuild skipped: the transcript holds no text yet')
+    return
+  }
+
+  await update($, rebuildProgressAtom, () => ({ done: 0, total: chunks.length }))
+  try {
+    const before = await readSnapshot($)
+    const turn = await read($, turnAtom)
+    let rebuilt = protectedOnly(before)
+
+    for (const [index, chunk] of chunks.entries()) {
+      const reply = await $.model.complete({
+        model,
+        system: UPDATE_SYSTEM,
+        prompt: rebuildChunkPrompt(rebuilt, chunk, index, chunks.length),
+        maxTokens: 4000,
+      })
+      const outcome = applyUpdateReply(rebuilt, await read($, statsAtom), reply, turn)
+      await update($, statsAtom, () => outcome.stats)
+      if (outcome.failure !== null) {
+        $.ui.log(`rebuild failed at part ${index + 1} of ${chunks.length}, nothing changed (${outcome.failure})`)
+        return
+      }
+      rebuilt = outcome.snapshot
+      await update($, rebuildProgressAtom, () => ({ done: index + 1, total: chunks.length }))
+    }
+
+    await changeSnapshot($, () => restoreFirstTurns(before, rebuilt))
+    await saveFiles($)
+  } finally {
+    await update($, rebuildProgressAtom, () => null)
+  }
+}
+
+/** Applies a reply to the state as it is now (not when the call started), records its cost, saves on success. */
+async function applyOutcome(
+  $: EngineInterface,
+  what: string,
+  apply: (snapshot: Snapshot, stats: UpdateStats) => ReplyOutcome,
+): Promise<void> {
+  const outcome = apply(await readSnapshot($), await read($, statsAtom))
+  await update($, statsAtom, () => outcome.stats)
+  if (outcome.failure !== null) {
+    $.ui.log(`${what} failed, nothing changed (${outcome.failure})`)
+    return
+  }
+  await changeSnapshot($, () => outcome.snapshot)
+  await saveFiles($)
+}
+
+async function addBtwExchange($: EngineInterface, question: string, answer: string): Promise<void> {
+  const exchange = { question, answer, atTurn: await read($, turnAtom) }
+  await update($, btwAtom, thread => [...thread, exchange].slice(-BTW_KEPT))
+}
+
+async function askBtw($: EngineInterface, model: string, question: string): Promise<void> {
+  await update($, btwPendingQuestionAtom, () => question)
+  await update($, btwNoticeAtom, () => null)
+  try {
+    const reply = await $.model.fork({ prompt: btwPrompt(question) })
+    if (reply.isAnswered) {
+      await update($, statsAtom, stats => addUsage(stats, reply.usage, false))
+      await addBtwExchange($, question, reply.text.trim())
+    } else if (reply.reason === 'nothing-to-fork') {
+      await answerBtwFromBearings($, model, question)
+    } else {
+      await update($, statsAtom, stats => addUsage(stats, reply.usage, true))
+      await update($, btwNoticeAtom, () => `No answer (${describeFailure(reply)}).`)
+    }
+  } finally {
+    await update($, btwPendingQuestionAtom, () => null)
+  }
+}
+
+/** With nothing to fork (a resumed process before its first request), answer from the bearings and the last messages. */
+async function answerBtwFromBearings($: EngineInterface, model: string, question: string): Promise<void> {
+  const recent = (await readTranscript($)).slice(-BTW_FALLBACK_MESSAGES)
+  const prompt = btwFallbackPrompt(question, snapshotMarkdown(await readSnapshot($)), recent)
+  const reply = await $.model.complete({ model, prompt })
+
+  if (reply.isAnswered) {
+    await update($, statsAtom, stats => addUsage(stats, reply.usage, false))
+    await addBtwExchange($, question, `${reply.text.trim()}\n\n_${BTW_FALLBACK_MARK}_`)
+  } else {
+    await update($, statsAtom, stats => addUsage(stats, reply.usage, true))
+    await update($, btwNoticeAtom, () => `No answer (${describeFailure(reply)}).`)
+  }
+}
+
+// -------------------------------------------------------------------------
+// Manual additions: the panes' inputs and the main model's tool
+
+/** A pane input line: a command edits the glossary or facts; anything else is a btw question where `isBtw`. */
+async function submitPaneInput($: EngineInterface, model: string, line: string, isBtw: boolean): Promise<void> {
+  const text = line.trim()
+  if (text === '') return
+
+  const command = parsePaneCommand(text)
+  if (command === null) {
+    if (isBtw) await askBtw($, model, text)
+    else $.ui.toast(COMMAND_HELP)
+    return
+  }
+
+  const applied = applyPaneCommand(await readSnapshot($), command, await read($, turnAtom))
+  await changeSnapshot($, () => applied.snapshot)
+  $.ui.toast(applied.message)
+  await syncProjectPins($)
+  await saveFiles($)
+}
+
+async function addFromTool($: EngineInterface, input: ToolAddInput): Promise<{ result: string } | { deny: string }> {
+  const outcome = applyToolAdd(await readSnapshot($), input, await read($, turnAtom))
+  if ('error' in outcome) return { deny: outcome.error }
+
+  await changeSnapshot($, () => outcome.snapshot)
+  await syncProjectPins($)
+  await saveFiles($)
+  return { result: outcome.message }
+}
+
+/** This session's .md file, or null where HOME is unset. It holds both views. */
+async function markdownPathOf($: EngineInterface): Promise<string | null> {
+  const place = await sessionFolder($, await $.session.cwd())
+  return place === null ? null : `${place.folder}/${await $.session.id()}.md`
+}
+
+/**
+ * `/glossary` and `/bearings`. In VS Code, whose chat panel draws no plugin pane, they open the
+ * session's .md file in an editor tab. With `print`, the view is drawn in the command's output
+ * row. Otherwise they open the pane.
+ */
+async function runViewCommand($: EngineInterface, view: 'glossary' | 'bearings', args: string): Promise<CommandRunResult> {
+  if ((await $.session.surfaces()).includes('vscode')) {
+    await openInVsCode($, view)
+    return {}
+  }
+  if (args.trim() === 'print') return printView($, view)
+
+  if (view === 'glossary') await openGlossary($)
+  else await openBearings($)
+  return { text: `${view === 'glossary' ? 'Glossary' : 'Bearings'} pane opened.` }
+}
+
+/**
+ * Keeps the view as it is now and answers a short stub naming it (`#<n>`); the model reads the
+ * stub only. The CommandOutput hook draws the kept view in place of the stub's row.
+ */
+async function printView($: EngineInterface, view: 'glossary' | 'bearings'): Promise<CommandRunResult> {
+  const markdown = viewSection(view, await readSnapshot($))
+  const markdownPath = await markdownPathOf($)
+  let n = 0
+  await update($, printsAtom, prints => {
+    n = (prints[prints.length - 1]?.n ?? 0) + 1
+    return [...prints, { n, view, markdown, markdownPath }].slice(-PRINTS_KEPT)
+  })
+  return { text: printStub(view, n) }
+}
+
+/** The drawing of the print an output row names, or null when the row names none or it is gone. */
+async function printDrawingFor($: EngineInterface, view: 'glossary' | 'bearings', rowText: string): Promise<string | null> {
+  const n = printNumberOf(rowText)
+  if (n === null) return null
+  const print = (await read($, printsAtom)).find(one => one.n === n && one.view === view)
+  return print === undefined ? null : printDrawing(print.markdown, print.markdownPath)
+}
+
+/** Opens the .md file with `code`; with no file or a failing `code`, logs the view as one line and says why. */
+async function openInVsCode($: EngineInterface, view: 'glossary' | 'bearings'): Promise<void> {
+  const path = await markdownPathOf($)
+  const failure = await runCode($, path)
+  if (failure === null) {
+    $.ui.log(`opened ${path} in VS Code`)
+    return
+  }
+  $.ui.log(printedView(view, await readSnapshot($), path))
+  $.ui.log(`not opened in VS Code: ${failure}`)
+}
+
+/** Runs `code <path>`; null when it worked, else why not. */
+async function runCode($: EngineInterface, path: string | null): Promise<string | null> {
+  if (path === null || !(await $.fs.exists(path))) return 'the session has no .md file yet'
+  try {
+    const ran = await $.process.run(['code', path])
+    return ran.exitCode === 0 ? null : `code exited with ${ran.exitCode} (${firstLine(ran.stderr)})`
+  } catch (error) {
+    return `code could not run (${(error as Error).message})`
+  }
+}
+
+function openGlossary($: EngineInterface) {
+  return $.ui.open({ id: GLOSSARY_PANE, title: 'Glossary' })
+}
+
+function openBearings($: EngineInterface) {
+  return $.ui.open({ id: BEARINGS_PANE, title: 'Bearings' })
+}
+
+export const register: Register = (on, options) => {
+  const model = typeof options.model === 'string' && options.model.trim() !== '' ? options.model.trim() : DEFAULT_MODEL
+
+  // -------------------------------------------------------------------------
+  // Events
+
+  on('session.start', async ($, e, next) => {
+    await update($, participationAtom, () => (e.isInteractive ? 'active' : 'off'))
+    if (!e.isInteractive) return next(e)
+
+    await $.command.register({
+      name: 'glossary', description: 'Open the Bearings glossary pane (print: show it in the transcript)', argumentHint: '[print]',
+    })
+    await $.command.register({
+      name: 'bearings', description: 'Open the Bearings pane (print: show it in the transcript)', argumentHint: '[print]',
+    })
+    await $.tool.register({ name: 'add', description: ADD_TOOL_DESCRIPTION, inputSchema: ADD_TOOL_SCHEMA })
+
+    try {
+      await coldStart($, e.cwd)
+    } catch (error) {
+      $.ui.log(`cold start skipped (${(error as Error).message})`)
+    }
+    ensureOtherSessionsPoll($)
+    return next(e)
+  })
+
+  on('command.run', { command: 'glossary' }, async ($, e) => runViewCommand($, 'glossary', e.args))
+  on('command.run', { command: 'bearings' }, async ($, e) => runViewCommand($, 'bearings', e.args))
+
+  // A printed view's output row: its stub text is replaced by the view as it was printed.
+  on('ui.render', { component: 'CommandOutput', props: { command: 'glossary' } }, async ($, e, next) => {
+    const drawing = await printDrawingFor($, 'glossary', e.props.text)
+    if (drawing === null) return next(e)
+    const { Markdown } = $.ui.resolve(e)
+    return <Markdown text={drawing} />
+  })
+
+  on('ui.render', { component: 'CommandOutput', props: { command: 'bearings' } }, async ($, e, next) => {
+    const drawing = await printDrawingFor($, 'bearings', e.props.text)
+    if (drawing === null) return next(e)
+    const { Markdown } = $.ui.resolve(e)
+    return <Markdown text={drawing} />
+  })
+
+  on('tool.call', { tool: 'mcp__bearings__add' }, async ($, e) => addFromTool($, e as ToolAddInput))
+
+  // turn.start fires for the main thread only; its prompt is kept until the turn completes.
+  on('turn.start', async ($, e, next) => {
+    if (await isOff($)) return next(e)
+    await update($, pendingPromptAtom, () => ({ turnId: e.turnId, text: e.text }))
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId !== undefined || (await isOff($))) return next(e)
+    ensureOtherSessionsPoll($)
+
+    const turn = await update($, turnAtom, count => count + 1)
+    const pending = await read($, pendingPromptAtom)
+    const prompt = pending !== null && pending.turnId === e.turnId ? pending.text : ''
+    await update($, pendingPromptAtom, () => null)
+
+    if (prompt.trim() !== '' || e.answer.trim() !== '') {
+      const finished: TurnText = { turn, prompt, answer: e.answer }
+      // A timer starts the update outside this dispatch, so the turn ends without waiting for it.
+      $.clock.after(0, () => updates.push(finished, turns => runUpdate($, model, turns)))
+    }
+    return next(e)
+  })
+
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    const isMainCompaction = e.agentId === undefined && e.trigger !== 'precompute'
+    if (!isMainCompaction || result.skip !== undefined || (await isOff($))) return result
+
+    const bearings = await read($, bearingsAtom)
+    const others = (await readOtherActiveSessions($)).map(summarize)
+    if (bearings === null && others.length === 0) return result
+
+    const own = bearings === null ? '_No bearings yet._' : bearingsSections(bearings, bearings.facts)
+    await appendNote($, compactionNote(own, others, await $.clock.now()))
+    return result
+  })
+
+  // -------------------------------------------------------------------------
+  // Drawing: the band above the prompt and the two panes
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey || (await isOff($))) return next(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
+
+    const glossary = await read($, glossaryAtom)
+    const bearings = await read($, bearingsAtom)
+    const turn = await read($, turnAtom)
+    const isBusy = (await read($, isUpdatingAtom)) || (await read($, rebuildProgressAtom)) !== null
+    const otherCount = (await read($, otherSessionsAtom)).length
+
+    const newCount = glossary.filter(entry => isNew(entry, turn)).length
+    const bearingsAge = bearings === null ? 'not built yet' : turnsAgo(turn - bearings.updatedAtTurn)
+
+    return (
+      <Box flexDirection="row" gap={2}>
+        <Button key="open-glossary" plain hotkey="g" label={`Glossary · ${newCount} new`} onPress={() => void openGlossary($)} />
+        <Button key="open-bearings" plain hotkey="b" label={`Bearings · ${bearingsAge}`} onPress={() => void openBearings($)} />
+        {otherCount > 0 && <Text dimColor>· {otherCountLabel(otherCount)}</Text>}
+        {isBusy && <Text dimColor>updating</Text>}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: GLOSSARY_PANE }, async ($, e) => {
+    const elements = $.ui.resolve(e)
+    const { Box, Button, Markdown, Text } = elements
+    const Input = 'Input' in elements ? elements.Input : undefined
+
+    const turn = await read($, turnAtom)
+    const isEarlierOpen = await read($, isGlossaryEarlierOpenAtom)
+    const { recent, earlier } = splitByRecency(await read($, glossaryAtom), turn)
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        {recent.length === 0
+          ? <Text dimColor>No terms in the last 30 turns.</Text>
+          : <Markdown text={capText(glossaryList(recent), MARKDOWN_LIMIT)} />}
+        {earlier.length > 0 && (
+          <Button
+            key="toggle-earlier"
+            plain
+            dimColor
+            label={`${isEarlierOpen ? 'Hide' : 'Show'} earlier (${earlier.length})`}
+            onPress={() => void update($, isGlossaryEarlierOpenAtom, isOpen => !isOpen)}
+          />
+        )}
+        {earlier.length > 0 && isEarlierOpen && <Markdown dimColor text={capText(glossaryList(earlier), MARKDOWN_LIMIT)} />}
+        {Input !== undefined && (
+          <Input
+            key="glossary-input"
+            placeholder="add: term = meaning · fact: text · pin: term · pin project: term · unpin: term"
+            onSubmit={value => void submitPaneInput($, model, value, false)}
+          />
+        )}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: BEARINGS_PANE }, async ($, e) => {
+    const elements = $.ui.resolve(e)
+    const { Box, Button, Markdown, Text } = elements
+    const Input = 'Input' in elements ? elements.Input : undefined
+
+    const turn = await read($, turnAtom)
+    const bearings = (await read($, bearingsAtom)) ?? emptyBearings()
+    const isEarlierOpen = await read($, isBearingsEarlierOpenAtom)
+    const rebuildProgress = await read($, rebuildProgressAtom)
+    const thread = await read($, btwAtom)
+    const pendingQuestion = await read($, btwPendingQuestionAtom)
+    const notice = await read($, btwNoticeAtom)
+    const stats = await read($, statsAtom)
+    const { recent: recentFacts, earlier: earlierFacts } = splitByRecency(bearings.facts, turn)
+    const inherited = bearings.inheritedFrom
+    const otherSessions = await read($, otherSessionsAtom)
+    const isOthersOpen = await read($, isOtherSessionsOpenAtom)
+    const now = await $.clock.now()
+
+    return (
+      <Box flexDirection="column" gap={1}>
+        {inherited !== undefined && (
+          <Text dimColor>
+            glossary seeded from the other sessions here (newest {shortId(inherited.sessionId)}, {relativeTime(Date.parse(inherited.savedAt), now)})
+          </Text>
+        )}
+        <Markdown text={capText(bearingsSections(bearings, recentFacts), MARKDOWN_LIMIT)} />
+        {earlierFacts.length > 0 && (
+          <Button
+            key="toggle-earlier"
+            plain
+            dimColor
+            label={`${isEarlierOpen ? 'Hide' : 'Show'} earlier facts (${earlierFacts.length})`}
+            onPress={() => void update($, isBearingsEarlierOpenAtom, isOpen => !isOpen)}
+          />
+        )}
+        {earlierFacts.length > 0 && isEarlierOpen && <Markdown dimColor text={capText(factList(earlierFacts), MARKDOWN_LIMIT)} />}
+        {otherSessions.length > 0 && (
+          <Button
+            key="toggle-other-sessions"
+            plain
+            dimColor
+            label={`${isOthersOpen ? 'Hide' : 'Show'} other sessions here (${otherSessions.length})`}
+            onPress={() => void update($, isOtherSessionsOpenAtom, isOpen => !isOpen)}
+          />
+        )}
+        {otherSessions.length > 0 && isOthersOpen && (
+          <Markdown text={capText(`## Other sessions here\n\n${sessionSections(otherSessions, now)}`, MARKDOWN_LIMIT)} />
+        )}
+        <Button key="rebuild" hotkey="r" label={rebuildLabel(rebuildProgress)} onPress={() => void rebuild($, model)} />
+        {thread.length > 0 && <Markdown text={capText(btwThread(thread), MARKDOWN_LIMIT)} />}
+        {pendingQuestion !== null && <Text dimColor>thinking: {pendingQuestion}</Text>}
+        {notice !== null && <Text dimColor>{notice}</Text>}
+        {Input !== undefined && (
+          <Input
+            key="btw-input"
+            placeholder="btw: a side question (or add: / fact: / pin: commands)"
+            submitLabel="ask"
+            onSubmit={value => void submitPaneInput($, model, value, true)}
+          />
+        )}
+        <Text dimColor>{statsLine(stats)}</Text>
+      </Box>
+    )
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Small text helpers for the drawing
+
+function turnsAgo(turns: number): string {
+  if (turns <= 0) return 'updated this turn'
+  return turns === 1 ? 'updated 1 turn ago' : `updated ${turns} turns ago`
+}
+
+function rebuildLabel(progress: { done: number; total: number } | null): string {
+  return progress === null ? 'Rebuild' : `rebuilding ${Math.min(progress.done + 1, progress.total)} of ${progress.total}`
+}
+
+function otherCountLabel(count: number): string {
+  return count === 1 ? '1 other session here' : `${count} other sessions here`
+}
+
+function statsLine(stats: UpdateStats): string {
+  return `${stats.calls} calls · ${stats.failures} failures · ${stats.inputTokens} in · ${stats.outputTokens} out · ${stats.cacheReadTokens} cache read`
+}
+
+function btwThread(exchanges: BtwExchange[]): string {
+  return exchanges.map(one => `**btw (T${one.atTurn}):** ${one.question}\n\n${one.answer}`).join('\n\n---\n\n')
+}
