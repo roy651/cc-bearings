@@ -5,6 +5,14 @@ Bearings is a Claude Code mod that helps you regain context. It is for people wh
 - **Glossary** lists the terms and ids from recent turns (acronyms, coined labels, backlog rows, gap codes) with a one-line meaning taken from the conversation. When the conversation does not state a meaning, it says so and does not guess.
 - **Bearings** shows the goal, sub-goals, what was done recently, what is in progress, what is expected next, the open decisions waiting on you, and the facts to hold.
 
+The Bearings pane, open beside the conversation. The band with the two buttons sits above the prompt.
+
+![The Bearings pane beside the conversation](docs/images/bearings-pane.png)
+
+The Glossary pane. Each entry ends with the turn where the term first appeared.
+
+![The Glossary pane beside the conversation](docs/images/glossary-pane.png)
+
 ## Requirements
 
 Claude Code 2.1.287 or later. Check with:
