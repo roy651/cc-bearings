@@ -41,9 +41,11 @@ function interactiveWorld(on: On, files: Record<string, unknown>) {
     written.push({ path: e.path, text: e.text })
     return { value: undefined }
   })
+  on('session.surfaces', () => ({ value: ['terminal'] as never }))
+  // Transcript lines only; the start's debug line is checked in participation.test.tsx.
   const logs: string[] = []
   on('ui.log', ($, e) => {
-    logs.push(e.text)
+    if (e.to !== 'debug') logs.push(e.text)
     return { value: undefined }
   })
   return { written, logs }
@@ -93,7 +95,11 @@ test('every session file carries the signature', async ($, on) => {
 
 test('a non-interactive session registers nothing, reads no files and draws no band', async ($, on) => {
   const calls: string[] = []
-  for (const event of ['command.register', 'tool.register', 'env.get', 'fs.list', 'fs.write', 'store.get', 'session.append'] as const) {
+  // The gate reads the entrypoint and the surfaces; neither names the VS Code panel here.
+  mock.env(on, { CLAUDE_CODE_ENTRYPOINT: 'sdk-ts' })
+  on('session.surfaces', () => ({ value: [] as never }))
+  on('ui.log', () => ({ value: undefined }))
+  for (const event of ['command.register', 'tool.register', 'fs.list', 'fs.write', 'store.get', 'session.append'] as const) {
     on(event, () => {
       calls.push(event)
       throw new Error(`${event} must not be called`)

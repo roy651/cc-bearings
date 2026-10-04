@@ -61,11 +61,12 @@ export interface SessionSummary {
 }
 
 /**
- * Whether this session takes part: `off` for a non-interactive run (-p, the SDK, a fixer),
- * `active` for the interactive main thread, `unknown` until session.start says (a hot reload
- * of a session that started before this key existed stays `unknown` and counts as active).
+ * Whether this session takes part: `active` for the interactive terminal or desktop session,
+ * `panel` for the VS Code chat panel (it takes part but draws no band or pane), `off` for a
+ * non-interactive run (-p, other SDK hosts, a fixer), `unknown` until session.start says (a hot
+ * reload of a session that started before this key existed stays `unknown` and counts as active).
  */
-export type Participation = 'unknown' | 'active' | 'off'
+export type Participation = 'unknown' | 'active' | 'panel' | 'off'
 
 /** One `/glossary print` or `/bearings print`: the view as it was then, drawn in that command's output row. */
 export interface PrintedView {

@@ -15,6 +15,7 @@ interface WorldOptions {
 function world(on: On, options: WorldOptions = {}) {
   const logs: string[] = []
   const processRuns: (readonly string[])[] = []
+  const written: { path: string; text: string }[] = []
 
   mock.env(on, { HOME: '/home/me' })
   mock.store(on)
@@ -23,7 +24,10 @@ function world(on: On, options: WorldOptions = {}) {
   on('session.id', () => ({ value: 'session-under-test' }))
   on('session.usage', () => ({ value: { startedAt: NOW } }) as never)
   on('session.surfaces', () => ({ value: (options.surfaces ?? ['terminal']) as never }))
-  on('fs.write', () => ({ value: undefined }))
+  on('fs.write', ($, e) => {
+    written.push({ path: e.path, text: e.text })
+    return { value: undefined }
+  })
   on('fs.exists', () => ({ value: options.mdExists ?? true }))
   on('process.run', ($, e) => {
     processRuns.push(e.argv)
@@ -39,7 +43,7 @@ function world(on: On, options: WorldOptions = {}) {
     const { Text } = $.ui.resolve(e)
     return <Text>engine row</Text>
   })
-  return { logs, processRuns }
+  return { logs, processRuns, written }
 }
 
 /** A slash command as the person types it at the prompt. */
@@ -110,11 +114,12 @@ describe('VS Code', () => {
     expect(logs[1]).toBe('not opened in VS Code: code exited with 1 (boom)')
   })
 
-  test('with no .md file yet, code is not run and the fallback says so', async ($, on) => {
-    const { logs, processRuns } = world(on, { surfaces: ['vscode'], mdExists: false })
-    await $.command.run(typed('glossary', ''))
-    expect(processRuns).toEqual([])
-    expect(logs[0]?.startsWith('# Glossary')).toBe(true)
-    expect(logs[1]).toBe('not opened in VS Code: the session has no .md file yet')
+  test('with no .md file yet, /bearings writes a placeholder and opens it', async ($, on) => {
+    const { logs, processRuns, written } = world(on, { surfaces: ['vscode'], mdExists: false })
+    const result = await $.command.run(typed('bearings', ''))
+    expect(result.text).toBeUndefined()
+    expect(written).toEqual([{ path: MD_PATH, text: '# Bearings\n\nNo bearings yet. They appear after the first turn completes.\n' }])
+    expect(processRuns).toEqual([['code', MD_PATH]])
+    expect(logs).toEqual([`opened ${MD_PATH} in VS Code`])
   })
 })

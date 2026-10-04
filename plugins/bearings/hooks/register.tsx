@@ -19,6 +19,7 @@ import {
   updatePrompt, UPDATE_SYSTEM,
 } from './prompts'
 import type { TranscriptMessage, TurnText } from './prompts'
+import { isVsCodePanel, participationAtStart } from './participation'
 import { createSerialQueue } from './queue'
 import { isNew, splitByRecency } from './retention'
 import {
@@ -39,6 +40,9 @@ const BEARINGS_PANE = 'bearings-map'
 
 const BTW_KEPT = 20
 const PRINTS_KEPT = 20
+
+/** What `/bearings` opens in VS Code before the first update has written the session's .md. */
+const MARKDOWN_PLACEHOLDER = '# Bearings\n\nNo bearings yet. They appear after the first turn completes.\n'
 /** How often the folder listing is re-read to see the other sessions here. */
 const OTHER_SESSIONS_POLL_MS = 60_000
 
@@ -391,7 +395,7 @@ async function markdownPathOf($: EngineInterface): Promise<string | null> {
  * row. Otherwise they open the pane.
  */
 async function runViewCommand($: EngineInterface, view: 'glossary' | 'bearings', args: string): Promise<CommandRunResult> {
-  if ((await $.session.surfaces()).includes('vscode')) {
+  if (await isInVsCodePanel($)) {
     await openInVsCode($, view)
     return {}
   }
@@ -437,15 +441,40 @@ async function openInVsCode($: EngineInterface, view: 'glossary' | 'bearings'): 
   $.ui.log(`not opened in VS Code: ${failure}`)
 }
 
-/** Runs `code <path>`; null when it worked, else why not. */
+/** Runs `code <path>`; null when it worked, else why not. A .md not written yet gets a placeholder first. */
 async function runCode($: EngineInterface, path: string | null): Promise<string | null> {
-  if (path === null || !(await $.fs.exists(path))) return 'the session has no .md file yet'
+  if (path === null) return 'HOME is not set, so the session has no .md file'
   try {
+    if (!(await $.fs.exists(path))) await $.fs.write(path, MARKDOWN_PLACEHOLDER)
     const ran = await $.process.run(['code', path])
     return ran.exitCode === 0 ? null : `code exited with ${ran.exitCode} (${firstLine(ran.stderr)})`
   } catch (error) {
     return `code could not run (${(error as Error).message})`
   }
+}
+
+/** Whether this is the VS Code chat panel: by the entrypoint, or by a `vscode` surface on the roster. */
+async function isInVsCodePanel($: EngineInterface): Promise<boolean> {
+  const entrypoint = await $.env.get('CLAUDE_CODE_ENTRYPOINT')
+  return isVsCodePanel({ entrypoint, surfaces: await $.session.surfaces() })
+}
+
+/** Registers the commands and the tool, builds the cold start, and starts watching the folder. */
+async function startParticipating($: EngineInterface, cwd: string): Promise<void> {
+  await $.command.register({
+    name: 'glossary', description: 'Open the Bearings glossary pane (print: show it in the transcript)', argumentHint: '[print]',
+  })
+  await $.command.register({
+    name: 'bearings', description: 'Open the Bearings pane (print: show it in the transcript)', argumentHint: '[print]',
+  })
+  await $.tool.register({ name: 'add', description: ADD_TOOL_DESCRIPTION, inputSchema: ADD_TOOL_SCHEMA })
+
+  try {
+    await coldStart($, cwd)
+  } catch (error) {
+    $.ui.log(`cold start skipped (${(error as Error).message})`)
+  }
+  ensureOtherSessionsPoll($)
 }
 
 function openGlossary($: EngineInterface) {
@@ -463,23 +492,30 @@ export const register: Register = (on, options) => {
   // Events
 
   on('session.start', async ($, e, next) => {
-    await update($, participationAtom, () => (e.isInteractive ? 'active' : 'off'))
-    if (!e.isInteractive) return next(e)
-
-    await $.command.register({
-      name: 'glossary', description: 'Open the Bearings glossary pane (print: show it in the transcript)', argumentHint: '[print]',
-    })
-    await $.command.register({
-      name: 'bearings', description: 'Open the Bearings pane (print: show it in the transcript)', argumentHint: '[print]',
-    })
-    await $.tool.register({ name: 'add', description: ADD_TOOL_DESCRIPTION, inputSchema: ADD_TOOL_SCHEMA })
-
-    try {
-      await coldStart($, e.cwd)
-    } catch (error) {
-      $.ui.log(`cold start skipped (${(error as Error).message})`)
+    const signals = {
+      isInteractive: e.isInteractive,
+      entrypoint: await $.env.get('CLAUDE_CODE_ENTRYPOINT'),
+      surfaces: await $.session.surfaces(),
     }
-    ensureOtherSessionsPoll($)
+    const participation = participationAtStart(signals)
+    await update($, participationAtom, () => participation)
+    $.ui.log(
+      `session start: isInteractive=${signals.isInteractive} surface=${e.surface} ` +
+        `surfaces=[${signals.surfaces.join(', ')}] entrypoint=${signals.entrypoint ?? '(unset)'} participation=${participation}`,
+      { to: 'debug' },
+    )
+
+    if (participation !== 'off') await startParticipating($, e.cwd)
+    return next(e)
+  })
+
+  // A session that started off switches on when the VS Code panel attaches later.
+  on('session.attach', async ($, e, next) => {
+    if (e.surface === 'vscode' && (await read($, participationAtom)) === 'off') {
+      await update($, participationAtom, () => 'panel')
+      $.ui.log('VS Code attached: participation=panel', { to: 'debug' })
+      await startParticipating($, await $.session.cwd())
+    }
     return next(e)
   })
 
@@ -545,7 +581,8 @@ export const register: Register = (on, options) => {
   // Drawing: the band above the prompt and the two panes
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey || (await isOff($))) return next(e)
+    const participation = await read($, participationAtom)
+    if (e.props.hasSurvey || participation === 'off' || participation === 'panel') return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
 
     const glossary = await read($, glossaryAtom)
