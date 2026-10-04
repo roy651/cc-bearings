@@ -1,6 +1,7 @@
 export type Pin = 'none' | 'session' | 'project'
 
-export type Source = 'auto' | 'operator' | 'claude' | 'inherited'
+/** Who wrote an entry. `repo` came from a scan of the repo's files (handoff, CLAUDE.md, README, git) and any update replaces it. */
+export type Source = 'auto' | 'operator' | 'claude' | 'inherited' | 'repo'
 
 export interface GlossaryEntry {
   term: string
@@ -18,6 +19,9 @@ export interface Fact {
   source: Source
 }
 
+/** The Bearings fields a repo scan may fill: the goal and the lists (facts carry their own source). */
+export type BearingsField = 'goal' | 'subGoals' | 'doneRecently' | 'inProgress' | 'expectedNext' | 'openDecisions'
+
 export interface Bearings {
   goal: string
   subGoals: string[]
@@ -28,6 +32,8 @@ export interface Bearings {
   facts: Fact[]
   updatedAtTurn: number
   inheritedFrom?: { sessionId: string; savedAt: string }
+  /** Fields whose current content came from a repo scan; an update that sets a field takes it off. */
+  repoFields?: BearingsField[]
 }
 
 export interface BtwExchange {
@@ -89,6 +95,7 @@ declare module 'claude-code' {
       stats: UpdateStats
       pendingPrompt: PendingPrompt | null
       isUpdating: boolean
+      isScanning: boolean
       /** While a rebuild runs: how many transcript chunks are done of how many; null otherwise. */
       rebuildProgress: { done: number; total: number } | null
       /** The btw question being answered right now, shown as "thinking". */

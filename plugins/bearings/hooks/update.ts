@@ -1,7 +1,7 @@
 import type { ModelForkResult, ModelUsage } from 'claude-code'
 
 import type { UpdateStats } from '../types'
-import { applyDelta, parseDelta } from './merge'
+import { applyDelta, applyScanDelta, parseDelta } from './merge'
 import type { Delta, Snapshot } from './merge'
 
 export function emptyStats(): UpdateStats {
@@ -58,4 +58,8 @@ function applyReply(
 
 export function applyUpdateReply(snapshot: Snapshot, stats: UpdateStats, reply: ModelForkResult, turn: number): ReplyOutcome {
   return applyReply(snapshot, stats, reply, delta => applyDelta(snapshot, delta, turn))
+}
+
+export function applyScanReply(snapshot: Snapshot, stats: UpdateStats, reply: ModelForkResult, turn: number): ReplyOutcome {
+  return applyReply(snapshot, stats, reply, delta => applyScanDelta(snapshot, delta, turn))
 }

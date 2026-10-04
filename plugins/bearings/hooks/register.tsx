@@ -10,13 +10,15 @@ import {
   bearingsSections, capText, factList, glossaryList, MARKDOWN_LIMIT, printDrawing, printedView, printNumberOf, printStub,
   relativeTime, snapshotMarkdown, viewSection,
 } from './markdown'
-import { emptyBearings, mergeProjectPins, projectPinsKey, projectPinsOf, protectedOnly, restoreFirstTurns } from './merge'
+import {
+  emptyBearings, isLean, mergeProjectPins, projectPinsKey, projectPinsOf, protectedOnly, restoreFirstTurns,
+} from './merge'
 import type { ProjectPins, Snapshot } from './merge'
 import { bearingsFolder, firstLine, readSessionFiles, saveSession } from './persist'
 import type { FileAccess, SavedSession } from './persist'
 import {
-  BTW_FALLBACK_MARK, BTW_FALLBACK_MESSAGES, btwFallbackPrompt, btwPrompt, rebuildChunkPrompt, transcriptChunks,
-  updatePrompt, UPDATE_SYSTEM,
+  BTW_FALLBACK_MARK, BTW_FALLBACK_MESSAGES, btwFallbackPrompt, btwPrompt, rebuildChunkPrompt, scanPrompt, SCAN_SYSTEM,
+  transcriptChunks, updatePrompt, UPDATE_SYSTEM,
 } from './prompts'
 import type { TranscriptMessage, TurnText } from './prompts'
 import { isVsCodePanel, participationAtStart } from './participation'
@@ -26,7 +28,9 @@ import {
   activeOthers, coldStartNote, compactionNote, inheritedBearings, mergeGlossaries, seedGlossary,
   sessionSections, shortId, summarize,
 } from './sessions'
-import { addUsage, applyUpdateReply, describeFailure, emptyStats } from './update'
+import { FILE_LIST_SOURCE, fitToBudget, GIT_LOG_SOURCE, GIT_STATUS_SOURCE, pickReadme, SCAN_FILES } from './scan'
+import type { ScanSource } from './scan'
+import { addUsage, applyScanReply, applyUpdateReply, describeFailure, emptyStats } from './update'
 import type { ReplyOutcome } from './update'
 
 // The engine checks that `$` is only passed to functions declared at the top of
@@ -54,6 +58,7 @@ const btwAtom = atom({ plugin: 'bearings', key: 'btw' } as const, [] as BtwExcha
 const statsAtom = atom({ plugin: 'bearings', key: 'stats' } as const, emptyStats() as UpdateStats)
 const pendingPromptAtom = atom({ plugin: 'bearings', key: 'pendingPrompt' } as const, null as PendingPrompt | null)
 const isUpdatingAtom = atom({ plugin: 'bearings', key: 'isUpdating' } as const, false)
+const isScanningAtom = atom({ plugin: 'bearings', key: 'isScanning' } as const, false)
 const rebuildProgressAtom = atom({ plugin: 'bearings', key: 'rebuildProgress' } as const, null as { done: number; total: number } | null)
 const btwPendingQuestionAtom = atom({ plugin: 'bearings', key: 'btwPendingQuestion' } as const, null as string | null)
 const btwNoticeAtom = atom({ plugin: 'bearings', key: 'btwNotice' } as const, null as string | null)
@@ -63,6 +68,12 @@ const otherSessionsAtom = atom({ plugin: 'bearings', key: 'otherSessions' } as c
 const isOtherSessionsOpenAtom = atom({ plugin: 'bearings', key: 'isOtherSessionsOpen' } as const, false)
 const participationAtom = atom({ plugin: 'bearings', key: 'participation' } as const, 'unknown' as Participation)
 const printsAtom = atom({ plugin: 'bearings', key: 'prints' } as const, [] as PrintedView[])
+
+/** How a rebuild or a scan ended, in one line for the log. */
+interface WorkOutcome {
+  isDone: boolean
+  message: string
+}
 
 // Turns that finish while an update runs are folded into the next single call.
 const updates = createSerialQueue<TurnText>()
@@ -201,8 +212,9 @@ function ensureOtherSessionsPoll($: EngineInterface): void {
  * When this session holds nothing yet: restores this session's own file (a resume), or else
  * seeds the glossary with the union of the other sessions active in this folder and tells the
  * model about them in one row (nothing when none is active). Then lays the project pins on top.
+ * With nothing restored or inherited, the repo is scanned once, from a timer so the start does not wait.
  */
-async function coldStart($: EngineInterface, cwd: string): Promise<void> {
+async function coldStart($: EngineInterface, model: string, cwd: string): Promise<void> {
   if (await hasContent($)) return
 
   const sessionId = await $.session.id()
@@ -222,6 +234,10 @@ async function coldStart($: EngineInterface, cwd: string): Promise<void> {
 
   const pins = await readProjectPins($, cwd)
   await changeSnapshot($, snapshot => mergeProjectPins(snapshot, pins))
+
+  if (own === undefined && others.length === 0) {
+    $.clock.after(0, () => void logIfNotDone($, () => scanRepo($, model)))
+  }
 
   const note = own === undefined ? coldStartNote(others, await $.clock.now()) : null
   if (note !== null) await appendNote($, note)
@@ -257,11 +273,15 @@ async function readTranscript($: EngineInterface): Promise<TranscriptMessage[]> 
  * background update's path in chunks, in order, each call taking the state so far. It starts
  * from the pinned and hand-added entries only, and nothing changes unless every chunk applies.
  */
-async function rebuild($: EngineInterface, model: string): Promise<{ isRebuilt: boolean; message: string }> {
-  if ((await read($, rebuildProgressAtom)) !== null) return { isRebuilt: false, message: 'a rebuild is already running' }
+async function rebuild($: EngineInterface, model: string): Promise<WorkOutcome> {
+  if ((await read($, rebuildProgressAtom)) !== null) return { isDone: false, message: 'a rebuild is already running' }
 
   const chunks = transcriptChunks(await readTranscript($))
-  if (chunks.length === 0) return { isRebuilt: false, message: 'rebuild skipped: the transcript holds no text yet' }
+  if (chunks.length === 0) {
+    // Nothing to fold, so no model call: the result would be empty, which is lean, so scan the repo.
+    const scan = await scanRepo($, model)
+    return { isDone: scan.isDone, message: `the transcript holds no conversation yet, so ${scan.message}` }
+  }
 
   await update($, rebuildProgressAtom, () => ({ done: 0, total: chunks.length }))
   try {
@@ -280,7 +300,7 @@ async function rebuild($: EngineInterface, model: string): Promise<{ isRebuilt: 
       await update($, statsAtom, () => outcome.stats)
       if (outcome.failure !== null) {
         return {
-          isRebuilt: false,
+          isDone: false,
           message: `rebuild failed at part ${index + 1} of ${chunks.length}, nothing changed (${outcome.failure})`,
         }
       }
@@ -290,38 +310,115 @@ async function rebuild($: EngineInterface, model: string): Promise<{ isRebuilt: 
 
     await changeSnapshot($, () => restoreFirstTurns(before, rebuilt))
     await saveFiles($)
-    return { isRebuilt: true, message: `rebuilt from ${chunks.length} chunks` }
+    const message = `rebuilt from ${chunks.length} chunks`
+    if (!isLean(rebuilt.bearings)) return { isDone: true, message }
+
+    // The transcript said too little to map the work: fill the gaps from the repo.
+    const scan = await scanRepo($, model)
+    return { isDone: true, message: `${message}; the result was lean, so ${scan.message}` }
   } finally {
     await update($, rebuildProgressAtom, () => null)
   }
 }
 
-/** The pane's Rebuild button: the pane shows the progress, and only a failure needs a line. */
-async function rebuildFromButton($: EngineInterface, model: string): Promise<void> {
-  const result = await rebuild($, model)
-  if (!result.isRebuilt) $.ui.log(result.message)
+/** The pane shows a rebuild's progress, so only a failure needs a line. */
+async function logIfNotDone($: EngineInterface, work: () => Promise<WorkOutcome>): Promise<void> {
+  const outcome = await work()
+  if (!outcome.isDone) $.ui.log(outcome.message)
 }
 
 /**
- * `/bearings rebuild`. The rebuild runs from a timer so the command does not hold the prompt.
- * In the terminal the Bearings pane opens and shows the progress. In the VS Code panel, which
- * has no pane, one line says it started and one how it ended, then the .md opens as `/bearings` does.
+ * `/bearings rebuild` and `/bearings scan`. The work runs from a timer so the command does not hold
+ * the prompt. In the terminal the Bearings pane opens and shows it. In the VS Code panel, which has
+ * no pane, one line says it started and one how it ended, then the .md opens as `/bearings` does.
  */
-async function rebuildFromCommand($: EngineInterface, model: string): Promise<CommandRunResult> {
+async function startFromCommand($: EngineInterface, model: string, what: 'rebuild' | 'scan'): Promise<CommandRunResult> {
+  const work = () => (what === 'rebuild' ? rebuild($, model) : scanRepo($, model))
   if (await isInVsCodePanel($)) {
-    $.ui.log('rebuilding bearings from the transcript')
-    $.clock.after(0, () => void finishPanelRebuild($, model))
+    $.ui.log(what === 'rebuild' ? 'rebuilding bearings from the transcript' : 'scanning the repo for bearings')
+    $.clock.after(0, () => void finishInPanel($, work))
     return {}
   }
   await openBearings($)
-  $.clock.after(0, () => void rebuildFromButton($, model))
+  $.clock.after(0, () => void logIfNotDone($, work))
   return {}
 }
 
-async function finishPanelRebuild($: EngineInterface, model: string): Promise<void> {
-  const result = await rebuild($, model)
-  $.ui.log(result.message)
+async function finishInPanel($: EngineInterface, work: () => Promise<WorkOutcome>): Promise<void> {
+  const outcome = await work()
+  $.ui.log(outcome.message)
   await openInVsCode($, 'bearings')
+}
+
+// -------------------------------------------------------------------------
+// Repo scan: seeds Bearings from the repo's own notes when the conversation says little
+
+/** The file's text, or null when it is missing or unreadable. */
+async function readFileOrNull($: EngineInterface, path: string): Promise<string | null> {
+  try {
+    return await $.fs.read(path)
+  } catch {
+    return null
+  }
+}
+
+/** A git command's output in `cwd`, or null when git fails (not a repo, no git). */
+async function gitOutput($: EngineInterface, argv: readonly string[], cwd: string): Promise<string | null> {
+  try {
+    const ran = await $.process.run(argv, { cwd })
+    return ran.exitCode === 0 ? ran.stdout.trim() : null
+  } catch {
+    return null
+  }
+}
+
+/** The scan's sources, most valuable first, missing ones skipped, cut together to the budget. */
+async function readScanSources($: EngineInterface, cwd: string): Promise<ScanSource[]> {
+  const topLevel = await $.fs.list(cwd).catch(() => [])
+  const readme = pickReadme(topLevel.map(entry => entry.name))
+  const sources: ScanSource[] = []
+
+  for (const name of [...SCAN_FILES, ...(readme === null ? [] : [readme])]) {
+    const text = await readFileOrNull($, `${cwd}/${name}`)
+    if (text !== null && text.trim() !== '') sources.push({ name, text })
+  }
+
+  const gitLog = await gitOutput($, ['git', 'log', '--oneline', '-15'], cwd)
+  if (gitLog !== null && gitLog !== '') sources.push({ name: GIT_LOG_SOURCE, text: gitLog })
+  const gitStatus = await gitOutput($, ['git', 'status', '--short'], cwd)
+  if (gitStatus !== null) sources.push({ name: GIT_STATUS_SOURCE, text: gitStatus === '' ? '(no uncommitted changes)' : gitStatus })
+
+  if (topLevel.length > 0) {
+    const names = topLevel.map(entry => (entry.kind === 'dir' ? `${entry.name}/` : entry.name))
+    sources.push({ name: FILE_LIST_SOURCE, text: names.join('\n') })
+  }
+  return fitToBudget(sources)
+}
+
+/** One model call over the repo's notes; its entries come in marked `repo` and fill only gaps. */
+async function scanRepo($: EngineInterface, model: string): Promise<WorkOutcome> {
+  if (await read($, isScanningAtom)) return { isDone: false, message: 'a scan is already running' }
+  await update($, isScanningAtom, () => true)
+  try {
+    const sources = await readScanSources($, await $.session.cwd())
+    if (sources.length === 0) return { isDone: false, message: 'scan skipped: the folder has no notes, git or files to read' }
+
+    const reply = await $.model.complete({
+      model,
+      system: SCAN_SYSTEM,
+      prompt: scanPrompt(await readSnapshot($), sources),
+      maxTokens: 4000,
+    })
+    const outcome = applyScanReply(await readSnapshot($), await read($, statsAtom), reply, await read($, turnAtom))
+    await update($, statsAtom, () => outcome.stats)
+    if (outcome.failure !== null) return { isDone: false, message: `scan failed, nothing changed (${outcome.failure})` }
+
+    await changeSnapshot($, () => outcome.snapshot)
+    await saveFiles($)
+    return { isDone: true, message: `scanned ${sources.length} sources from the repo` }
+  } finally {
+    await update($, isScanningAtom, () => false)
+  }
 }
 
 /** Applies a reply to the state as it is now (not when the call started), records its cost, saves on success. */
@@ -428,7 +525,8 @@ async function runViewCommand(
   view: 'glossary' | 'bearings',
   args: string,
 ): Promise<CommandRunResult> {
-  if (view === 'bearings' && args.trim() === 'rebuild') return rebuildFromCommand($, model)
+  const word = args.trim()
+  if (view === 'bearings' && (word === 'rebuild' || word === 'scan')) return startFromCommand($, model, word)
   if (await isInVsCodePanel($)) {
     await openInVsCode($, view)
     return {}
@@ -494,19 +592,19 @@ async function isInVsCodePanel($: EngineInterface): Promise<boolean> {
 }
 
 /** Registers the commands and the tool, builds the cold start, and starts watching the folder. */
-async function startParticipating($: EngineInterface, cwd: string): Promise<void> {
+async function startParticipating($: EngineInterface, model: string, cwd: string): Promise<void> {
   await $.command.register({
     name: 'glossary', description: 'Open the Bearings glossary pane (print: show it in the transcript)', argumentHint: '[print]',
   })
   await $.command.register({
     name: 'bearings',
-    description: 'Open the Bearings pane (print: show it in the transcript; rebuild: regenerate it from the transcript)',
-    argumentHint: '[print|rebuild]',
+    description: 'Open the Bearings pane (print: in the transcript; rebuild: from the transcript; scan: from the repo)',
+    argumentHint: '[print|rebuild|scan]',
   })
   await $.tool.register({ name: 'add', description: ADD_TOOL_DESCRIPTION, inputSchema: ADD_TOOL_SCHEMA })
 
   try {
-    await coldStart($, cwd)
+    await coldStart($, model, cwd)
   } catch (error) {
     $.ui.log(`cold start skipped (${(error as Error).message})`)
   }
@@ -541,7 +639,7 @@ export const register: Register = (on, options) => {
       { to: 'debug' },
     )
 
-    if (participation !== 'off') await startParticipating($, e.cwd)
+    if (participation !== 'off') await startParticipating($, model, e.cwd)
     return next(e)
   })
 
@@ -550,7 +648,7 @@ export const register: Register = (on, options) => {
     if (e.surface === 'vscode' && (await read($, participationAtom)) === 'off') {
       await update($, participationAtom, () => 'panel')
       $.ui.log('VS Code attached: participation=panel', { to: 'debug' })
-      await startParticipating($, await $.session.cwd())
+      await startParticipating($, model, await $.session.cwd())
     }
     return next(e)
   })
@@ -624,7 +722,8 @@ export const register: Register = (on, options) => {
     const glossary = await read($, glossaryAtom)
     const bearings = await read($, bearingsAtom)
     const turn = await read($, turnAtom)
-    const isBusy = (await read($, isUpdatingAtom)) || (await read($, rebuildProgressAtom)) !== null
+    const isBusy =
+      (await read($, isUpdatingAtom)) || (await read($, isScanningAtom)) || (await read($, rebuildProgressAtom)) !== null
     const otherCount = (await read($, otherSessionsAtom)).length
 
     const newCount = glossary.filter(entry => isNew(entry, turn)).length
@@ -724,7 +823,7 @@ export const register: Register = (on, options) => {
         {otherSessions.length > 0 && isOthersOpen && (
           <Markdown text={capText(`## Other sessions here\n\n${sessionSections(otherSessions, now)}`, MARKDOWN_LIMIT)} />
         )}
-        <Button key="rebuild" hotkey="r" label={rebuildLabel(rebuildProgress)} onPress={() => void rebuildFromButton($, model)} />
+        <Button key="rebuild" hotkey="r" label={rebuildLabel(rebuildProgress)} onPress={() => void logIfNotDone($, () => rebuild($, model))} />
         {thread.length > 0 && <Markdown text={capText(btwThread(thread), MARKDOWN_LIMIT)} />}
         {pendingQuestion !== null && <Text dimColor>thinking: {pendingQuestion}</Text>}
         {notice !== null && <Text dimColor>{notice}</Text>}

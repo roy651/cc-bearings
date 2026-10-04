@@ -14,7 +14,7 @@ const TWO_CHUNK_TRANSCRIPT = [
   { role: 'assistant' as const, text: `MARK-TWO ${'y'.repeat(40_000)}`, toolUses: [] },
 ]
 
-/** Records, in order, every model call, `code` run and log line; answers chunk n with the term `C<n>`. */
+/** Records, in order, every model call, `code` run and log line; answers chunk n with the term `C<n>` and a full Bearings. */
 function world(on: On, surfaces: string[]) {
   const events: string[] = []
   const completePrompts: string[] = []
@@ -34,7 +34,9 @@ function world(on: On, surfaces: string[]) {
     completePrompts.push(e.prompt)
     events.push('model.complete')
     const term = `C${/number="(\d+)"/.exec(e.prompt)?.[1] ?? '?'}`
-    return { value: { isAnswered: true, text: JSON.stringify({ glossary: { upsert: [{ term, meaning: 'm' }] } }), usage: USAGE } }
+    // A full result (a goal and three items), so the rebuild is not lean and no repo scan follows.
+    const reply = { glossary: { upsert: [{ term, meaning: 'm' }] }, bearings: { goal: 'g', inProgress: ['a', 'b', 'c'] } }
+    return { value: { isAnswered: true, text: JSON.stringify(reply), usage: USAGE } }
   })
   on('process.run', ($, e) => {
     events.push(`run ${e.argv.join(' ')}`)

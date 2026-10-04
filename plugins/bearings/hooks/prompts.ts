@@ -1,4 +1,5 @@
 import type { Snapshot } from './merge'
+import type { ScanSource } from './scan'
 
 /** One finished main-thread turn, as the background update reads it. */
 export interface TurnText {
@@ -97,13 +98,22 @@ function splitToLimit(text: string, limit: number): string[] {
   return pieces
 }
 
+/** The markup a slash command leaves in the transcript (its caveat, name, args, output): no conversation. */
+const COMMAND_MARKUP = /<(local-command-caveat|command-name|command-message|command-args|local-command-stdout|local-command-stderr)>[\s\S]*?<\/\1>/g
+
+/** A message's text without slash-command markup; '' for a row that only records a command. */
+export function conversationText(text: string): string {
+  return text.replace(COMMAND_MARKUP, '').trim()
+}
+
 /**
  * The transcript, in order, packed into chunks of at most `limit` characters.
- * Messages with no text are left out; one longer than a chunk is cut across several.
+ * Messages with no conversation text are left out; one longer than a chunk is cut across several.
  */
 export function transcriptChunks(messages: TranscriptMessage[], limit = REBUILD_CHUNK_LIMIT): string[] {
   const pieces = messages
-    .filter(message => message.text.trim() !== '')
+    .map(message => ({ ...message, text: conversationText(message.text) }))
+    .filter(message => message.text !== '')
     .flatMap(message => splitToLimit(messageBlock(message), limit))
 
   const chunks: string[] = []
@@ -152,3 +162,22 @@ Question: ${question}`
 }
 
 export const BTW_FALLBACK_MARK = '(from bearings, not the full conversation)'
+
+export const SCAN_SYSTEM = `You keep a glossary and a map of where the work stands for a person who works in a code repository with an AI assistant, and who often steps away. The conversation has said little so far, so you start the map from the repository itself.
+
+You receive the current glossary and map as JSON, and the repository's own notes: a handoff file, instruction files, the README, recent commits, uncommitted changes and the top-level files. Deduce from them the goal, sub-goals, what is in progress, what is expected next, and facts to hold, and take glossary terms that these files define. Answer with one JSON object and nothing else: a delta in this shape.
+
+${DELTA_SHAPE}
+
+- Fill only what the files support; leave a field out when they say nothing about it.
+- "seen" and "factsSeen": leave empty.
+
+${RULES}`
+
+/** The scan's one request: the state so far and the repository's sources, each already cut to fit. */
+export function scanPrompt(snapshot: Snapshot, sources: ScanSource[]): string {
+  const blocks = sources.map(source =>
+    `<source name="${source.name}"${source.isCut === true ? ' cut="true"' : ''}>\n${source.text}\n</source>`,
+  )
+  return `<current>\n${currentStateJson(snapshot)}\n</current>\n\n<repo>\n${blocks.join('\n')}\n</repo>\n\nAnswer with the JSON delta only.`
+}

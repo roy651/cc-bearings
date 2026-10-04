@@ -1,4 +1,4 @@
-import type { Bearings, Fact, GlossaryEntry } from '../types'
+import type { Bearings, BearingsField, Fact, GlossaryEntry } from '../types'
 import type { Snapshot } from './merge'
 
 /** A Markdown element draws at most 10000 characters; stay under it with room for the cut note. */
@@ -15,8 +15,16 @@ function pinMark(pin: GlossaryEntry['pin']): string {
   return ''
 }
 
+const FROM_REPO = ' (from repo)'
+
+function whenSeen(entry: GlossaryEntry): string {
+  if (entry.source === 'inherited') return 'earlier session'
+  if (entry.source === 'repo') return 'from repo'
+  return `T${entry.firstTurn}`
+}
+
 export function glossaryLine(entry: GlossaryEntry): string {
-  const when = entry.source === 'inherited' ? 'earlier session' : `T${entry.firstTurn}`
+  const when = whenSeen(entry)
   return `- **${entry.term}**: ${entry.meaning} (${when})${pinMark(entry.pin)}`
 }
 
@@ -25,23 +33,26 @@ export function glossaryList(entries: GlossaryEntry[]): string {
   return newestFirst.map(glossaryLine).join('\n')
 }
 
-function bulletList(items: string[]): string {
-  return items.length === 0 ? '_none_' : items.map(item => `- ${item}`).join('\n')
+function bulletList(items: string[], mark = ''): string {
+  return items.length === 0 ? '_none_' : items.map(item => `- ${item}${mark}`).join('\n')
 }
 
 export function factList(facts: Fact[]): string {
-  return facts.length === 0 ? '_none_' : facts.map(fact => `- ${fact.text}${pinMark(fact.pin)}`).join('\n')
+  if (facts.length === 0) return '_none_'
+  return facts.map(fact => `- ${fact.text}${fact.source === 'repo' ? FROM_REPO : ''}${pinMark(fact.pin)}`).join('\n')
 }
 
 /** The Bearings sections in the order of the Bearings shape, with the facts given separately (recent ones in the pane). */
 export function bearingsSections(bearings: Bearings, facts: Fact[]): string {
+  const repoFields = bearings.repoFields ?? []
+  const mark = (field: BearingsField) => (repoFields.includes(field) ? FROM_REPO : '')
   return [
-    `## Goal\n${bearings.goal || '_not stated yet_'}`,
-    `## Sub-goals\n${bulletList(bearings.subGoals)}`,
-    `## Done recently\n${bulletList(bearings.doneRecently)}`,
-    `## In progress\n${bulletList(bearings.inProgress)}`,
-    `## Expected next\n${bulletList(bearings.expectedNext)}`,
-    `## Open decisions\n${bulletList(bearings.openDecisions)}`,
+    `## Goal\n${bearings.goal === '' ? '_not stated yet_' : `${bearings.goal}${mark('goal')}`}`,
+    `## Sub-goals\n${bulletList(bearings.subGoals, mark('subGoals'))}`,
+    `## Done recently\n${bulletList(bearings.doneRecently, mark('doneRecently'))}`,
+    `## In progress\n${bulletList(bearings.inProgress, mark('inProgress'))}`,
+    `## Expected next\n${bulletList(bearings.expectedNext, mark('expectedNext'))}`,
+    `## Open decisions\n${bulletList(bearings.openDecisions, mark('openDecisions'))}`,
     `## Facts to hold\n${factList(facts)}`,
   ].join('\n\n')
 }

@@ -1,4 +1,4 @@
-import type { Bearings, Fact, GlossaryEntry, Pin, Source } from '../types'
+import type { Bearings, BearingsField, Fact, GlossaryEntry, Pin, Source } from '../types'
 
 /** The two things the mod keeps, as one value the merge functions take and return. */
 export interface Snapshot {
@@ -154,10 +154,16 @@ function applyBearingsDelta(current: Bearings, delta: Delta['bearings'], turn: n
   // Once this session has updated the map, it no longer reads as another session's.
   delete next.inheritedFrom
 
-  if (delta.goal !== undefined) next.goal = delta.goal
+  // A field the conversation sets is no longer the repo's.
+  if (delta.goal !== undefined) {
+    next.goal = delta.goal
+    next.repoFields = withoutField(next.repoFields, 'goal')
+  }
   for (const field of LIST_FIELDS) {
     const list = delta[field]
-    if (list !== undefined) next[field] = list
+    if (list === undefined) continue
+    next[field] = list
+    next.repoFields = withoutField(next.repoFields, field)
   }
 
   for (const text of delta.factsAdd ?? []) {
@@ -173,7 +179,72 @@ function applyBearingsDelta(current: Bearings, delta: Delta['bearings'], turn: n
 function addOrTouchFact(facts: Fact[], text: string, source: Source, turn: number): Fact[] {
   const existing = facts.find(fact => sameText(fact.text, text))
   if (existing === undefined) return [...facts, { text: text.trim(), lastSeenTurn: turn, pin: 'none', source }]
-  return facts.map(fact => (fact === existing ? { ...fact, lastSeenTurn: turn } : fact))
+  // The conversation restating a repo fact makes it the conversation's.
+  const nextSource = existing.source === 'repo' ? source : existing.source
+  return facts.map(fact => (fact === existing ? { ...fact, lastSeenTurn: turn, source: nextSource } : fact))
+}
+
+function withoutField(fields: BearingsField[] | undefined, field: BearingsField): BearingsField[] | undefined {
+  return fields?.filter(one => one !== field)
+}
+
+// ---------------------------------------------------------------------------
+// Repo scan: fills only what is empty or came from an earlier scan
+
+/**
+ * Applies a scan's delta. Its entries and items are marked `repo`. It never overwrites an entry,
+ * fact or field that the conversation, a person or the main model wrote, nor a pinned one.
+ */
+export function applyScanDelta(snapshot: Snapshot, delta: Delta, turn: number): Snapshot {
+  return {
+    glossary: applyScanGlossary(snapshot.glossary, delta.glossary.upsert, turn),
+    bearings: applyScanBearings(snapshot.bearings ?? emptyBearings(), delta.bearings, turn),
+  }
+}
+
+function applyScanGlossary(entries: GlossaryEntry[], upsert: Delta['glossary']['upsert'], turn: number): GlossaryEntry[] {
+  let result = entries
+  for (const { term, meaning } of upsert) {
+    const existing = result.find(entry => sameText(entry.term, term))
+    if (existing === undefined) {
+      result = [...result, { term, meaning, firstTurn: turn, lastSeenTurn: turn, pin: 'none', source: 'repo' }]
+    } else if (existing.source === 'repo' && existing.pin === 'none') {
+      result = result.map(entry => (entry === existing ? { ...entry, meaning, lastSeenTurn: turn } : entry))
+    }
+  }
+  return result
+}
+
+function applyScanBearings(current: Bearings, delta: Delta['bearings'], turn: number): Bearings {
+  const next: Bearings = { ...current, facts: [...current.facts] }
+  const repoFields = new Set(current.repoFields ?? [])
+  const mayFill = (field: BearingsField, isEmpty: boolean) => isEmpty || repoFields.has(field)
+
+  if (delta.goal !== undefined && delta.goal.trim() !== '' && mayFill('goal', current.goal.trim() === '')) {
+    next.goal = delta.goal
+    repoFields.add('goal')
+  }
+  for (const field of LIST_FIELDS) {
+    const list = delta[field]
+    if (list === undefined || list.length === 0 || !mayFill(field, current[field].length === 0)) continue
+    next[field] = list
+    repoFields.add(field)
+  }
+  for (const text of delta.factsAdd ?? []) {
+    if (!next.facts.some(fact => sameText(fact.text, text))) {
+      next.facts = [...next.facts, { text: text.trim(), lastSeenTurn: turn, pin: 'none', source: 'repo' }]
+    }
+  }
+
+  next.repoFields = [...repoFields]
+  return next
+}
+
+/** A Bearings worth filling from the repo: no goal, or fewer than 3 items across sub-goals, in progress, next and facts. */
+export function isLean(bearings: Bearings | null): boolean {
+  if (bearings === null || bearings.goal.trim() === '') return true
+  const items = bearings.subGoals.length + bearings.inProgress.length + bearings.expectedNext.length + bearings.facts.length
+  return items < 3
 }
 
 // ---------------------------------------------------------------------------
