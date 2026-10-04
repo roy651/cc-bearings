@@ -56,6 +56,8 @@ To use a hotkey, click the button in the fullscreen terminal, or press ctrl+x th
 
 Add `print` (`/bearings print`) to draw the view inline in the conversation instead of opening a pane. Claude reads only a one-line stub, not the view. In the VS Code chat panel the commands open the session's Markdown file instead.
 
+`/bearings rebuild` regenerates the glossary and bearings from the whole transcript, as the pane's Rebuild button does, keeping pinned and hand-added entries.
+
 Both panes have an input line. Lines are read as commands when they start with one of these prefixes:
 
 ```
@@ -93,7 +95,7 @@ Subagents do not take part. Non-interactive runs (`claude -p`, the SDK) register
 |---|---|
 | Terminal CLI, including JetBrains and editor terminals | Full |
 | Claude desktop app, Code tab | Full |
-| VS Code extension chat panel | Background updates and files work. No band or panes. `/glossary` and `/bearings` open the session's live Markdown file in an editor tab (needs the `code` command on your PATH). For btw and editing, run `claude` in the VS Code terminal. |
+| VS Code extension chat panel | Background updates and files work. No band or panes. `/glossary` and `/bearings` open the session's live Markdown file in an editor tab (needs the `code` command on your PATH). `/bearings rebuild` logs when it starts and ends, then opens the file. For btw and editing, run `claude` in the VS Code terminal. |
 | Remote Control from claude.ai or mobile | Updates run. The views draw only in the terminal on your machine. |
 | Cloud sessions | Not loaded unless the plugin is installed there |
 

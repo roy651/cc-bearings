@@ -257,14 +257,11 @@ async function readTranscript($: EngineInterface): Promise<TranscriptMessage[]> 
  * background update's path in chunks, in order, each call taking the state so far. It starts
  * from the pinned and hand-added entries only, and nothing changes unless every chunk applies.
  */
-async function rebuild($: EngineInterface, model: string): Promise<void> {
-  if ((await read($, rebuildProgressAtom)) !== null) return
+async function rebuild($: EngineInterface, model: string): Promise<{ isRebuilt: boolean; message: string }> {
+  if ((await read($, rebuildProgressAtom)) !== null) return { isRebuilt: false, message: 'a rebuild is already running' }
 
   const chunks = transcriptChunks(await readTranscript($))
-  if (chunks.length === 0) {
-    $.ui.log('rebuild skipped: the transcript holds no text yet')
-    return
-  }
+  if (chunks.length === 0) return { isRebuilt: false, message: 'rebuild skipped: the transcript holds no text yet' }
 
   await update($, rebuildProgressAtom, () => ({ done: 0, total: chunks.length }))
   try {
@@ -282,8 +279,10 @@ async function rebuild($: EngineInterface, model: string): Promise<void> {
       const outcome = applyUpdateReply(rebuilt, await read($, statsAtom), reply, turn)
       await update($, statsAtom, () => outcome.stats)
       if (outcome.failure !== null) {
-        $.ui.log(`rebuild failed at part ${index + 1} of ${chunks.length}, nothing changed (${outcome.failure})`)
-        return
+        return {
+          isRebuilt: false,
+          message: `rebuild failed at part ${index + 1} of ${chunks.length}, nothing changed (${outcome.failure})`,
+        }
       }
       rebuilt = outcome.snapshot
       await update($, rebuildProgressAtom, () => ({ done: index + 1, total: chunks.length }))
@@ -291,9 +290,38 @@ async function rebuild($: EngineInterface, model: string): Promise<void> {
 
     await changeSnapshot($, () => restoreFirstTurns(before, rebuilt))
     await saveFiles($)
+    return { isRebuilt: true, message: `rebuilt from ${chunks.length} chunks` }
   } finally {
     await update($, rebuildProgressAtom, () => null)
   }
+}
+
+/** The pane's Rebuild button: the pane shows the progress, and only a failure needs a line. */
+async function rebuildFromButton($: EngineInterface, model: string): Promise<void> {
+  const result = await rebuild($, model)
+  if (!result.isRebuilt) $.ui.log(result.message)
+}
+
+/**
+ * `/bearings rebuild`. The rebuild runs from a timer so the command does not hold the prompt.
+ * In the terminal the Bearings pane opens and shows the progress. In the VS Code panel, which
+ * has no pane, one line says it started and one how it ended, then the .md opens as `/bearings` does.
+ */
+async function rebuildFromCommand($: EngineInterface, model: string): Promise<CommandRunResult> {
+  if (await isInVsCodePanel($)) {
+    $.ui.log('rebuilding bearings from the transcript')
+    $.clock.after(0, () => void finishPanelRebuild($, model))
+    return {}
+  }
+  await openBearings($)
+  $.clock.after(0, () => void rebuildFromButton($, model))
+  return {}
+}
+
+async function finishPanelRebuild($: EngineInterface, model: string): Promise<void> {
+  const result = await rebuild($, model)
+  $.ui.log(result.message)
+  await openInVsCode($, 'bearings')
 }
 
 /** Applies a reply to the state as it is now (not when the call started), records its cost, saves on success. */
@@ -394,7 +422,13 @@ async function markdownPathOf($: EngineInterface): Promise<string | null> {
  * session's .md file in an editor tab. With `print`, the view is drawn in the command's output
  * row. Otherwise they open the pane.
  */
-async function runViewCommand($: EngineInterface, view: 'glossary' | 'bearings', args: string): Promise<CommandRunResult> {
+async function runViewCommand(
+  $: EngineInterface,
+  model: string,
+  view: 'glossary' | 'bearings',
+  args: string,
+): Promise<CommandRunResult> {
+  if (view === 'bearings' && args.trim() === 'rebuild') return rebuildFromCommand($, model)
   if (await isInVsCodePanel($)) {
     await openInVsCode($, view)
     return {}
@@ -465,7 +499,9 @@ async function startParticipating($: EngineInterface, cwd: string): Promise<void
     name: 'glossary', description: 'Open the Bearings glossary pane (print: show it in the transcript)', argumentHint: '[print]',
   })
   await $.command.register({
-    name: 'bearings', description: 'Open the Bearings pane (print: show it in the transcript)', argumentHint: '[print]',
+    name: 'bearings',
+    description: 'Open the Bearings pane (print: show it in the transcript; rebuild: regenerate it from the transcript)',
+    argumentHint: '[print|rebuild]',
   })
   await $.tool.register({ name: 'add', description: ADD_TOOL_DESCRIPTION, inputSchema: ADD_TOOL_SCHEMA })
 
@@ -519,8 +555,8 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('command.run', { command: 'glossary' }, async ($, e) => runViewCommand($, 'glossary', e.args))
-  on('command.run', { command: 'bearings' }, async ($, e) => runViewCommand($, 'bearings', e.args))
+  on('command.run', { command: 'glossary' }, async ($, e) => runViewCommand($, model, 'glossary', e.args))
+  on('command.run', { command: 'bearings' }, async ($, e) => runViewCommand($, model, 'bearings', e.args))
 
   // A printed view's output row: its stub text is replaced by the view as it was printed.
   on('ui.render', { component: 'CommandOutput', props: { command: 'glossary' } }, async ($, e, next) => {
@@ -688,7 +724,7 @@ export const register: Register = (on, options) => {
         {otherSessions.length > 0 && isOthersOpen && (
           <Markdown text={capText(`## Other sessions here\n\n${sessionSections(otherSessions, now)}`, MARKDOWN_LIMIT)} />
         )}
-        <Button key="rebuild" hotkey="r" label={rebuildLabel(rebuildProgress)} onPress={() => void rebuild($, model)} />
+        <Button key="rebuild" hotkey="r" label={rebuildLabel(rebuildProgress)} onPress={() => void rebuildFromButton($, model)} />
         {thread.length > 0 && <Markdown text={capText(btwThread(thread), MARKDOWN_LIMIT)} />}
         {pendingQuestion !== null && <Text dimColor>thinking: {pendingQuestion}</Text>}
         {notice !== null && <Text dimColor>{notice}</Text>}
