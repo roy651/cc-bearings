@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { snapshotMarkdown } from '../hooks/markdown'
 import { emptyBearings } from '../hooks/merge'
-import { bearingsFolder, readSessionFiles, saveSession } from '../hooks/persist'
+import { appendBounded, bearingsFolder, failureLogPath, readSessionFiles, saveSession } from '../hooks/persist'
 import type { FileAccess, SavedSession } from '../hooks/persist'
 import { emptyStats } from '../hooks/update'
 
@@ -77,4 +77,14 @@ test('sessions come newest first; broken files and a missing folder read as noth
 
   expect((await readSessionFiles(access, '/f')).map(one => one.sessionId)).toEqual(['newer', 'older'])
   expect(await readSessionFiles(access, '/nowhere')).toEqual([])
+})
+
+test('the failure log sits beside the session file and drops its oldest whole lines past the limit', () => {
+  expect(failureLogPath('/f', 's1')).toBe('/f/s1.failures.log')
+  expect(appendBounded('', 'one')).toBe('one\n')
+  expect(appendBounded('one\n', 'two')).toBe('one\ntwo\n')
+
+  const full = appendBounded('aaaa\nbbbb\n', 'cccc', 12)
+  expect(full).toBe('bbbb\ncccc\n')
+  expect(appendBounded('aaaa\n', 'bbbb', 12)).toBe('aaaa\nbbbb\n')
 })

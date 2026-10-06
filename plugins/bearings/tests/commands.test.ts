@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { applyPaneCommand, applyToolAdd, parsePaneCommand } from '../hooks/commands'
+import { applyKnownCommand, applyPaneCommand, applyToolAdd, parsePaneCommand, toolKnownCommand } from '../hooks/commands'
 import { emptyBearings, mergeProjectPins, projectPinsOf } from '../hooks/merge'
 import type { Snapshot } from '../hooks/merge'
 
@@ -85,5 +85,35 @@ describe('applyToolAdd', () => {
     expect('error' in applyToolAdd(base, { term: 'X' }, 1)).toBe(true)
     expect('error' in applyToolAdd(base, {}, 1)).toBe(true)
     expect('error' in applyToolAdd(base, { fact: 'f', pin: 'forever' }, 1)).toBe(true)
+  })
+})
+
+describe('known terms', () => {
+  test('reads known: and unknown: lines', () => {
+    expect(parsePaneCommand('known: FMA')).toEqual({ kind: 'known', term: 'FMA' })
+    expect(parsePaneCommand('Unknown:  FMA ')).toEqual({ kind: 'unknown', term: 'FMA' })
+  })
+
+  test('marking adds the term once; a term not in the glossary yet can be marked', () => {
+    const marked = applyKnownCommand([], base.glossary, { kind: 'known', term: 'FMA' })
+    expect(marked).toEqual({ knownTerms: ['FMA'], message: 'Marked "FMA" as known: hidden from the glossary pane.' })
+
+    const again = applyKnownCommand(['FMA'], base.glossary, { kind: 'known', term: 'fma' })
+    expect(again).toEqual({ knownTerms: ['FMA'], message: '"fma" is already known.' })
+
+    const absent = applyKnownCommand([], base.glossary, { kind: 'known', term: 'BME' })
+    expect(absent.message).toBe('Marked "BME" as known: hidden from the glossary pane. It is not in the glossary yet.')
+  })
+
+  test('unknown takes the mark off, matching case-insensitively', () => {
+    expect(applyKnownCommand(['FMA', 'BME'], base.glossary, { kind: 'unknown', term: 'fma' }))
+      .toEqual({ knownTerms: ['BME'], message: '"fma" shows in the glossary pane again.' })
+    expect(applyKnownCommand([], base.glossary, { kind: 'unknown', term: 'FMA' }).message).toBe('"FMA" is not marked known.')
+  })
+
+  test('the tool input names a known command with "known" or "unknown", else none', () => {
+    expect(toolKnownCommand({ known: ' FMA ' })).toEqual({ kind: 'known', term: 'FMA' })
+    expect(toolKnownCommand({ unknown: 'FMA' })).toEqual({ kind: 'unknown', term: 'FMA' })
+    expect(toolKnownCommand({ term: 'FMA', meaning: 'x' })).toBeNull()
   })
 })

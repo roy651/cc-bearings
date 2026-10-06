@@ -26,6 +26,24 @@ export interface Delta {
 
 const LIST_FIELDS = ['subGoals', 'doneRecently', 'inProgress', 'expectedNext', 'openDecisions'] as const
 
+/** The most items these lists keep. The prompt asks the model to stay under it, and the merge enforces it. */
+export const LIST_CAPS: Partial<Record<BearingsField, number>> = { subGoals: 10, expectedNext: 10 }
+
+/** Lists go newest last, so a list over its cap keeps its last items. */
+export function capList(field: BearingsField, list: string[]): string[] {
+  const cap = LIST_CAPS[field]
+  return cap === undefined || list.length <= cap ? list : list.slice(-cap)
+}
+
+function sameList(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((item, index) => sameText(item, b[index]!))
+}
+
+/** Records that `field` changed at `turn`. */
+function markChanged(bearings: Bearings, field: BearingsField, turn: number): void {
+  bearings.changedAtTurn = { ...bearings.changedAtTurn, [field]: turn }
+}
+
 export function emptyBearings(): Bearings {
   return {
     goal: '',
@@ -156,13 +174,17 @@ function applyBearingsDelta(current: Bearings, delta: Delta['bearings'], turn: n
 
   // A field the conversation sets is no longer the repo's.
   if (delta.goal !== undefined) {
+    if (!sameText(delta.goal, current.goal)) markChanged(next, 'goal', turn)
     next.goal = delta.goal
     next.repoFields = withoutField(next.repoFields, 'goal')
   }
   for (const field of LIST_FIELDS) {
     const list = delta[field]
     if (list === undefined) continue
-    next[field] = list
+    const capped = capList(field, list)
+    // A list restated unchanged keeps the turn it last changed.
+    if (!sameList(capped, current[field])) markChanged(next, field, turn)
+    next[field] = capped
     next.repoFields = withoutField(next.repoFields, field)
   }
 
@@ -222,12 +244,14 @@ function applyScanBearings(current: Bearings, delta: Delta['bearings'], turn: nu
 
   if (delta.goal !== undefined && delta.goal.trim() !== '' && mayFill('goal', current.goal.trim() === '')) {
     next.goal = delta.goal
+    markChanged(next, 'goal', turn)
     repoFields.add('goal')
   }
   for (const field of LIST_FIELDS) {
     const list = delta[field]
     if (list === undefined || list.length === 0 || !mayFill(field, current[field].length === 0)) continue
-    next[field] = list
+    next[field] = capList(field, list)
+    markChanged(next, field, turn)
     repoFields.add(field)
   }
   for (const text of delta.factsAdd ?? []) {

@@ -1,11 +1,14 @@
 import { atom, read, update } from 'claude-code'
-import type { CommandRunResult, EngineInterface, Register } from 'claude-code'
+import type { CommandRunResult, EngineInterface, ModelForkResult, Register } from 'claude-code'
 
 import type {
   Bearings, BtwExchange, GlossaryEntry, Participation, PendingPrompt, PrintedView, SessionSummary, UpdateStats,
 } from '../types'
-import { applyPaneCommand, applyToolAdd, COMMAND_HELP, parsePaneCommand } from './commands'
-import type { ToolAddInput } from './commands'
+import {
+  applyKnownCommand, applyPaneCommand, applyToolAdd, COMMAND_HELP, isKnownCommand, knownTermsKey, parsePaneCommand,
+  toolKnownCommand,
+} from './commands'
+import type { KnownCommand, ToolAddInput } from './commands'
 import {
   bearingsSections, capText, factList, glossaryList, MARKDOWN_LIMIT, printDrawing, printedView, printNumberOf, printStub,
   relativeTime, snapshotMarkdown, viewSection,
@@ -14,7 +17,7 @@ import {
   emptyBearings, isLean, mergeProjectPins, projectPinsKey, projectPinsOf, protectedOnly, restoreFirstTurns,
 } from './merge'
 import type { ProjectPins, Snapshot } from './merge'
-import { bearingsFolder, firstLine, readSessionFiles, saveSession } from './persist'
+import { appendBounded, bearingsFolder, failureLogPath, firstLine, readSessionFiles, saveSession } from './persist'
 import type { FileAccess, SavedSession } from './persist'
 import {
   BTW_FALLBACK_MARK, BTW_FALLBACK_MESSAGES, btwFallbackPrompt, btwPrompt, rebuildChunkPrompt, scanPrompt, SCAN_SYSTEM,
@@ -23,14 +26,16 @@ import {
 import type { TranscriptMessage, TurnText } from './prompts'
 import { isVsCodePanel, participationAtStart } from './participation'
 import { createSerialQueue } from './queue'
-import { isNew, splitByRecency } from './retention'
+import { isKnown, isNew, splitByRecency } from './retention'
 import {
   activeOthers, coldStartNote, compactionNote, inheritedBearings, mergeGlossaries, seedGlossary,
   sessionSections, shortId, summarize,
 } from './sessions'
 import { FILE_LIST_SOURCE, fitToBudget, GIT_LOG_SOURCE, GIT_STATUS_SOURCE, pickReadme, SCAN_FILES } from './scan'
 import type { ScanSource } from './scan'
-import { addUsage, applyScanReply, applyUpdateReply, describeFailure, emptyStats } from './update'
+import {
+  addUsage, applyBackgroundUpdate, applyScanReply, applyUpdateReply, describeFailure, emptyStats, failureLogLine,
+} from './update'
 import type { ReplyOutcome } from './update'
 
 // The engine checks that `$` is only passed to functions declared at the top of
@@ -49,6 +54,8 @@ const PRINTS_KEPT = 20
 const MARKDOWN_PLACEHOLDER = '# Bearings\n\nNo bearings yet. They appear after the first turn completes.\n'
 /** How often the folder listing is re-read to see the other sessions here. */
 const OTHER_SESSIONS_POLL_MS = 60_000
+/** The reply cap of every background call (update, rebuild, scan). */
+const BACKGROUND_MAX_TOKENS = 8000
 
 // Session state, declared in PluginState (types/index.d.ts).
 const glossaryAtom = atom({ plugin: 'bearings', key: 'glossary' } as const, [] as GlossaryEntry[])
@@ -68,6 +75,7 @@ const otherSessionsAtom = atom({ plugin: 'bearings', key: 'otherSessions' } as c
 const isOtherSessionsOpenAtom = atom({ plugin: 'bearings', key: 'isOtherSessionsOpen' } as const, false)
 const participationAtom = atom({ plugin: 'bearings', key: 'participation' } as const, 'unknown' as Participation)
 const printsAtom = atom({ plugin: 'bearings', key: 'prints' } as const, [] as PrintedView[])
+const knownTermsAtom = atom({ plugin: 'bearings', key: 'knownTerms' } as const, [] as string[])
 
 /** How a rebuild or a scan ended, in one line for the log. */
 interface WorkOutcome {
@@ -85,7 +93,8 @@ const ADD_TOOL_DESCRIPTION =
   'Adds a term with its meaning, or a fact, to the Bearings glossary and map the operator reads in a side pane. ' +
   'Call it only when the operator asks you to add, note or pin something there. ' +
   'Give "term" and "meaning", or "fact". "pin": "session" keeps it in view all session, ' +
-  '"project" keeps it in every session in this folder.'
+  '"project" keeps it in every session in this folder. ' +
+  'Give "known" with a term the operator already knows to hide it from the glossary pane, "unknown" to show it again.'
 
 const ADD_TOOL_SCHEMA = {
   type: 'object',
@@ -94,6 +103,8 @@ const ADD_TOOL_SCHEMA = {
     meaning: { type: 'string', description: 'One line, taken from the conversation.' },
     fact: { type: 'string', description: 'A fact to hold, in one short sentence.' },
     pin: { type: 'string', enum: ['none', 'session', 'project'] },
+    known: { type: 'string', description: 'A term the operator already knows: hidden from the glossary pane in this folder.' },
+    unknown: { type: 'string', description: 'A known term to show in the glossary pane again.' },
   },
 }
 
@@ -161,6 +172,34 @@ async function saveFiles($: EngineInterface): Promise<void> {
     await saveSession(place.files, place.folder, saved, snapshotMarkdown(snapshot))
   } catch (error) {
     $.ui.log(`could not write ${place.folder}: ${(error as Error).message}`)
+  }
+}
+
+/** Loads this folder's known terms from the store into the session. */
+async function loadKnownTerms($: EngineInterface, cwd: string): Promise<void> {
+  const stored = (await $.store.get(knownTermsKey(cwd))) as string[] | undefined
+  await update($, knownTermsAtom, () => stored ?? [])
+}
+
+/** Applies a known or unknown command to the session and the store, and says what it did. */
+async function applyKnown($: EngineInterface, command: KnownCommand): Promise<string> {
+  const applied = applyKnownCommand(await read($, knownTermsAtom), await read($, glossaryAtom), command)
+  await update($, knownTermsAtom, () => applied.knownTerms)
+  await $.store.set(knownTermsKey(await $.session.cwd()), applied.knownTerms)
+  return applied.message
+}
+
+/** Appends one line to the session's failure log. A failed write is logged, never thrown. */
+async function logFailure($: EngineInterface, what: string, turn: number, failure: string, reply: ModelForkResult): Promise<void> {
+  const place = await sessionFolder($, await $.session.cwd())
+  if (place === null) return
+  const path = failureLogPath(place.folder, await $.session.id())
+  const line = failureLogLine(new Date(await $.clock.now()).toISOString(), what, turn, failure, reply)
+  try {
+    const existing = (await $.fs.exists(path)) ? await $.fs.read(path) : ''
+    await $.fs.write(path, appendBounded(existing, line))
+  } catch (error) {
+    $.ui.log(`could not write ${path}: ${(error as Error).message}`)
   }
 }
 
@@ -253,10 +292,14 @@ async function runUpdate($: EngineInterface, model: string, turns: TurnText[]): 
     const reply = await $.model.complete({
       model,
       system: UPDATE_SYSTEM,
-      prompt: updatePrompt(await readSnapshot($), turns),
-      maxTokens: 4000,
+      prompt: updatePrompt(await readSnapshot($), turns, latestTurn),
+      maxTokens: BACKGROUND_MAX_TOKENS,
     })
-    await applyOutcome($, 'update', (snapshot, stats) => applyUpdateReply(snapshot, stats, reply, latestTurn))
+    const knownTerms = await read($, knownTermsAtom)
+    const failure = await applyOutcome(
+      $, 'update', (snapshot, stats) => applyBackgroundUpdate(snapshot, stats, reply, latestTurn, knownTerms),
+    )
+    if (failure !== null) await logFailure($, 'update', latestTurn, failure, reply)
   } finally {
     await update($, isUpdatingAtom, () => false)
   }
@@ -293,12 +336,13 @@ async function rebuild($: EngineInterface, model: string): Promise<WorkOutcome> 
       const reply = await $.model.complete({
         model,
         system: UPDATE_SYSTEM,
-        prompt: rebuildChunkPrompt(rebuilt, chunk, index, chunks.length),
-        maxTokens: 4000,
+        prompt: rebuildChunkPrompt(rebuilt, chunk, index, chunks.length, turn),
+        maxTokens: BACKGROUND_MAX_TOKENS,
       })
       const outcome = applyUpdateReply(rebuilt, await read($, statsAtom), reply, turn)
       await update($, statsAtom, () => outcome.stats)
       if (outcome.failure !== null) {
+        await logFailure($, `rebuild part ${index + 1} of ${chunks.length}`, turn, outcome.failure, reply)
         return {
           isDone: false,
           message: `rebuild failed at part ${index + 1} of ${chunks.length}, nothing changed (${outcome.failure})`,
@@ -406,12 +450,16 @@ async function scanRepo($: EngineInterface, model: string): Promise<WorkOutcome>
     const reply = await $.model.complete({
       model,
       system: SCAN_SYSTEM,
-      prompt: scanPrompt(await readSnapshot($), sources),
-      maxTokens: 4000,
+      prompt: scanPrompt(await readSnapshot($), sources, await read($, turnAtom)),
+      maxTokens: BACKGROUND_MAX_TOKENS,
     })
-    const outcome = applyScanReply(await readSnapshot($), await read($, statsAtom), reply, await read($, turnAtom))
+    const turn = await read($, turnAtom)
+    const outcome = applyScanReply(await readSnapshot($), await read($, statsAtom), reply, turn)
     await update($, statsAtom, () => outcome.stats)
-    if (outcome.failure !== null) return { isDone: false, message: `scan failed, nothing changed (${outcome.failure})` }
+    if (outcome.failure !== null) {
+      await logFailure($, 'scan', turn, outcome.failure, reply)
+      return { isDone: false, message: `scan failed, nothing changed (${outcome.failure})` }
+    }
 
     await changeSnapshot($, () => outcome.snapshot)
     await saveFiles($)
@@ -421,20 +469,24 @@ async function scanRepo($: EngineInterface, model: string): Promise<WorkOutcome>
   }
 }
 
-/** Applies a reply to the state as it is now (not when the call started), records its cost, saves on success. */
+/**
+ * Applies a reply to the state as it is now (not when the call started), records its cost, saves on success.
+ * Returns why it failed, or null.
+ */
 async function applyOutcome(
   $: EngineInterface,
   what: string,
   apply: (snapshot: Snapshot, stats: UpdateStats) => ReplyOutcome,
-): Promise<void> {
+): Promise<string | null> {
   const outcome = apply(await readSnapshot($), await read($, statsAtom))
   await update($, statsAtom, () => outcome.stats)
   if (outcome.failure !== null) {
     $.ui.log(`${what} failed, nothing changed (${outcome.failure})`)
-    return
+    return outcome.failure
   }
   await changeSnapshot($, () => outcome.snapshot)
   await saveFiles($)
+  return null
 }
 
 async function addBtwExchange($: EngineInterface, question: string, answer: string): Promise<void> {
@@ -490,6 +542,10 @@ async function submitPaneInput($: EngineInterface, model: string, line: string, 
     else $.ui.toast(COMMAND_HELP)
     return
   }
+  if (isKnownCommand(command)) {
+    $.ui.toast(await applyKnown($, command))
+    return
+  }
 
   const applied = applyPaneCommand(await readSnapshot($), command, await read($, turnAtom))
   await changeSnapshot($, () => applied.snapshot)
@@ -499,6 +555,9 @@ async function submitPaneInput($: EngineInterface, model: string, line: string, 
 }
 
 async function addFromTool($: EngineInterface, input: ToolAddInput): Promise<{ result: string } | { deny: string }> {
+  const knownCommand = toolKnownCommand(input)
+  if (knownCommand !== null) return { result: await applyKnown($, knownCommand) }
+
   const outcome = applyToolAdd(await readSnapshot($), input, await read($, turnAtom))
   if ('error' in outcome) return { deny: outcome.error }
 
@@ -602,6 +661,7 @@ async function startParticipating($: EngineInterface, model: string, cwd: string
     argumentHint: '[print|rebuild|scan]',
   })
   await $.tool.register({ name: 'add', description: ADD_TOOL_DESCRIPTION, inputSchema: ADD_TOOL_SCHEMA })
+  await loadKnownTerms($, cwd)
 
   try {
     await coldStart($, model, cwd)
@@ -726,7 +786,8 @@ export const register: Register = (on, options) => {
       (await read($, isUpdatingAtom)) || (await read($, isScanningAtom)) || (await read($, rebuildProgressAtom)) !== null
     const otherCount = (await read($, otherSessionsAtom)).length
 
-    const newCount = glossary.filter(entry => isNew(entry, turn)).length
+    const knownTerms = await read($, knownTermsAtom)
+    const newCount = glossary.filter(entry => isNew(entry, turn) && !isKnown(entry.term, knownTerms)).length
     const bearingsAge = bearings === null ? 'not built yet' : turnsAgo(turn - bearings.updatedAtTurn)
 
     return (
@@ -746,7 +807,11 @@ export const register: Register = (on, options) => {
 
     const turn = await read($, turnAtom)
     const isEarlierOpen = await read($, isGlossaryEarlierOpenAtom)
-    const { recent, earlier } = splitByRecency(await read($, glossaryAtom), turn)
+    const knownTerms = await read($, knownTermsAtom)
+    const glossary = await read($, glossaryAtom)
+    const shown = glossary.filter(entry => !isKnown(entry.term, knownTerms))
+    const knownCount = glossary.length - shown.length
+    const { recent, earlier } = splitByRecency(shown, turn)
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -763,10 +828,11 @@ export const register: Register = (on, options) => {
           />
         )}
         {earlier.length > 0 && isEarlierOpen && <Markdown dimColor text={capText(glossaryList(earlier), MARKDOWN_LIMIT)} />}
+        {knownCount > 0 && <Text dimColor>{knownCountLabel(knownCount)}</Text>}
         {Input !== undefined && (
           <Input
             key="glossary-input"
-            placeholder="add: term = meaning · fact: text · pin: term · pin project: term · unpin: term"
+            placeholder="add: term = meaning · fact: text · pin: term · pin project: term · unpin: term · known: term"
             onSubmit={value => void submitPaneInput($, model, value, false)}
           />
         )}
@@ -800,7 +866,7 @@ export const register: Register = (on, options) => {
             glossary seeded from the other sessions here (newest {shortId(inherited.sessionId)}, {relativeTime(Date.parse(inherited.savedAt), now)})
           </Text>
         )}
-        <Markdown text={capText(bearingsSections(bearings, recentFacts), MARKDOWN_LIMIT)} />
+        <Markdown text={capText(bearingsSections(bearings, recentFacts, turn), MARKDOWN_LIMIT)} />
         {earlierFacts.length > 0 && (
           <Button
             key="toggle-earlier"
@@ -851,6 +917,10 @@ function turnsAgo(turns: number): string {
 
 function rebuildLabel(progress: { done: number; total: number } | null): string {
   return progress === null ? 'Rebuild' : `rebuilding ${Math.min(progress.done + 1, progress.total)} of ${progress.total}`
+}
+
+function knownCountLabel(count: number): string {
+  return count === 1 ? '1 known term hidden (unknown: <term> shows it)' : `${count} known terms hidden (unknown: <term> shows one)`
 }
 
 function otherCountLabel(count: number): string {

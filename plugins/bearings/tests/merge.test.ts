@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { GlossaryEntry } from '../types'
-import { applyDelta, emptyBearings, parseDelta, protectedOnly, restoreFirstTurns } from '../hooks/merge'
+import { applyDelta, applyScanDelta, emptyBearings, parseDelta, protectedOnly, restoreFirstTurns } from '../hooks/merge'
 import type { Delta, Snapshot } from '../hooks/merge'
 
 function entry(term: string, meaning: string, extra: Partial<GlossaryEntry> = {}): GlossaryEntry {
@@ -109,5 +109,39 @@ describe('rebuild helpers', () => {
     const result = restoreFirstTurns(before, rebuilt)
     expect(result.glossary.find(one => one.term === 'SAME')?.firstTurn).toBe(3)
     expect(result.glossary.find(one => one.term === 'KEEP')?.meaning).toBe('pinned meaning')
+  })
+})
+
+describe('list caps', () => {
+  const twelve = Array.from({ length: 12 }, (_, index) => `item ${index + 1}`)
+
+  test('sub-goals and expected next keep their newest 10 (the last ones); other lists are not capped', () => {
+    const result = applyDelta({ glossary: [], bearings: null }, delta({}, { subGoals: twelve, expectedNext: twelve, doneRecently: twelve }), 3)
+    expect(result.bearings?.subGoals).toEqual(twelve.slice(2))
+    expect(result.bearings?.expectedNext.length).toBe(10)
+    expect(result.bearings?.doneRecently.length).toBe(12)
+  })
+
+  test('a scan is capped the same way', () => {
+    const result = applyScanDelta({ glossary: [], bearings: null }, delta({}, { subGoals: twelve }), 0)
+    expect(result.bearings?.subGoals).toEqual(twelve.slice(2))
+  })
+})
+
+describe('the turn each field last changed', () => {
+  test('a field that changes records the turn; one restated unchanged keeps its turn', () => {
+    const first = applyDelta({ glossary: [], bearings: null }, delta({}, { goal: 'ship', inProgress: ['tests'] }), 4)
+    expect(first.bearings?.changedAtTurn).toEqual({ goal: 4, inProgress: 4 })
+
+    const restated = applyDelta(first, delta({}, { goal: 'Ship', inProgress: ['Tests'] }), 9)
+    expect(restated.bearings?.changedAtTurn).toEqual({ goal: 4, inProgress: 4 })
+
+    const changed = applyDelta(restated, delta({}, { inProgress: ['tests', 'review'] }), 12)
+    expect(changed.bearings?.changedAtTurn).toEqual({ goal: 4, inProgress: 12 })
+  })
+
+  test('a scan that fills a field records the turn', () => {
+    const result = applyScanDelta({ glossary: [], bearings: null }, delta({}, { goal: 'from the repo', expectedNext: ['x'] }), 0)
+    expect(result.bearings?.changedAtTurn).toEqual({ goal: 0, expectedNext: 0 })
   })
 })

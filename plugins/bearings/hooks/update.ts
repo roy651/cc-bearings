@@ -3,6 +3,7 @@ import type { ModelForkResult, ModelUsage } from 'claude-code'
 import type { UpdateStats } from '../types'
 import { applyDelta, applyScanDelta, parseDelta } from './merge'
 import type { Delta, Snapshot } from './merge'
+import { pruneStale } from './retention'
 
 export function emptyStats(): UpdateStats {
   return { calls: 0, failures: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 }
@@ -60,6 +61,30 @@ export function applyUpdateReply(snapshot: Snapshot, stats: UpdateStats, reply: 
   return applyReply(snapshot, stats, reply, delta => applyDelta(snapshot, delta, turn))
 }
 
+/** The background update after each turn: the reply applied, then the stale automatic items pruned. */
+export function applyBackgroundUpdate(
+  snapshot: Snapshot,
+  stats: UpdateStats,
+  reply: ModelForkResult,
+  turn: number,
+  knownTerms: readonly string[],
+): ReplyOutcome {
+  const outcome = applyUpdateReply(snapshot, stats, reply, turn)
+  if (outcome.failure !== null) return outcome
+  return { ...outcome, snapshot: pruneStale(outcome.snapshot, turn, knownTerms) }
+}
+
 export function applyScanReply(snapshot: Snapshot, stats: UpdateStats, reply: ModelForkResult, turn: number): ReplyOutcome {
   return applyReply(snapshot, stats, reply, delta => applyScanDelta(snapshot, delta, turn))
+}
+
+/** How much of a failed reply's text its log line keeps. */
+export const FAILURE_EXCERPT_LIMIT = 300
+
+/** One line of the failure log: when, the turn, which call, why, the output tokens and the reply's start. */
+export function failureLogLine(at: string, what: string, turn: number, failure: string, reply: ModelForkResult): string {
+  const outputTokens = 'usage' in reply ? ` out=${reply.usage.output_tokens}` : ''
+  const text = reply.isAnswered ? reply.text.replace(/\s+/g, ' ').trim() : ''
+  const excerpt = text === '' ? '' : ` excerpt: ${text.slice(0, FAILURE_EXCERPT_LIMIT)}`
+  return `${at} T${turn} ${what} failed: ${failure}${outputTokens}${excerpt}`
 }

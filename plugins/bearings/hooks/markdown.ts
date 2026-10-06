@@ -42,17 +42,32 @@ export function factList(facts: Fact[]): string {
   return facts.map(fact => `- ${fact.text}${fact.source === 'repo' ? FROM_REPO : ''}${pinMark(fact.pin)}`).join('\n')
 }
 
-/** The Bearings sections in the order of the Bearings shape, with the facts given separately (recent ones in the pane). */
-export function bearingsSections(bearings: Bearings, facts: Fact[]): string {
+/** "changed 3 turns ago" style, for a field that last changed at `changedAt`. */
+export function changedAgo(changedAt: number, currentTurn: number): string {
+  const turns = currentTurn - changedAt
+  if (turns <= 0) return 'changed this turn'
+  return turns === 1 ? 'changed 1 turn ago' : `changed ${turns} turns ago`
+}
+
+/**
+ * The Bearings sections in the order of the Bearings shape, with the facts given separately (recent ones in the pane).
+ * With `currentTurn` (the pane), each heading whose field records a change says how long ago it changed.
+ */
+export function bearingsSections(bearings: Bearings, facts: Fact[], currentTurn?: number): string {
   const repoFields = bearings.repoFields ?? []
   const mark = (field: BearingsField) => (repoFields.includes(field) ? FROM_REPO : '')
+  const heading = (title: string, field: BearingsField) => {
+    const changedAt = bearings.changedAtTurn?.[field]
+    if (currentTurn === undefined || changedAt === undefined) return `## ${title}`
+    return `## ${title} (${changedAgo(changedAt, currentTurn)})`
+  }
   return [
-    `## Goal\n${bearings.goal === '' ? '_not stated yet_' : `${bearings.goal}${mark('goal')}`}`,
-    `## Sub-goals\n${bulletList(bearings.subGoals, mark('subGoals'))}`,
-    `## Done recently\n${bulletList(bearings.doneRecently, mark('doneRecently'))}`,
-    `## In progress\n${bulletList(bearings.inProgress, mark('inProgress'))}`,
-    `## Expected next\n${bulletList(bearings.expectedNext, mark('expectedNext'))}`,
-    `## Open decisions\n${bulletList(bearings.openDecisions, mark('openDecisions'))}`,
+    `${heading('Goal', 'goal')}\n${bearings.goal === '' ? '_not stated yet_' : `${bearings.goal}${mark('goal')}`}`,
+    `${heading('Sub-goals', 'subGoals')}\n${bulletList(bearings.subGoals, mark('subGoals'))}`,
+    `${heading('Done recently', 'doneRecently')}\n${bulletList(bearings.doneRecently, mark('doneRecently'))}`,
+    `${heading('In progress', 'inProgress')}\n${bulletList(bearings.inProgress, mark('inProgress'))}`,
+    `${heading('Expected next', 'expectedNext')}\n${bulletList(bearings.expectedNext, mark('expectedNext'))}`,
+    `${heading('Open decisions', 'openDecisions')}\n${bulletList(bearings.openDecisions, mark('openDecisions'))}`,
     `## Facts to hold\n${factList(facts)}`,
   ].join('\n\n')
 }

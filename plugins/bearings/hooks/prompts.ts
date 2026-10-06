@@ -1,4 +1,5 @@
 import type { Snapshot } from './merge'
+import { RECENT_TURNS } from './retention'
 import type { ScanSource } from './scan'
 
 /** One finished main-thread turn, as the background update reads it. */
@@ -34,17 +35,20 @@ const RULES = `Rules:
 - Keep each meaning to one line.
 - Bearings items are short, plain sentences.
 - Open decisions are only questions the assistant asked the operator that the operator has not answered yet.
-- Facts are things to hold in mind while working (numbers, paths, constraints, agreed choices).`
+- Facts are things to hold in mind while working (numbers, paths, constraints, agreed choices).
+- Lists go oldest first, newest last.
+- "subGoals" and "expectedNext" hold at most 10 items each: drop items that are done and merge near-duplicates.`
 
 export const UPDATE_SYSTEM = `You keep a glossary and a map of where the work stands for a person who follows a long working conversation between an operator and an AI assistant, and who often steps away.
 
-You receive the current glossary and map as JSON, and the newest turn or turns of the conversation. Answer with one JSON object and nothing else: a delta in this shape.
+You receive the current glossary's terms (names only, without their meanings) and the map as JSON, and the newest turn or turns of the conversation. Answer with one JSON object and nothing else: a delta in this shape.
 
 ${DELTA_SHAPE}
 
 - "upsert": terms that are new, or whose meaning the new turns state or change.
 - "seen": known terms the new turns mention without changing their meaning.
-- In "bearings", include a field only when it changes; a list you include replaces the old list whole.
+- In "bearings", always include "inProgress", restated from the newest turns even when it has not changed. Include any other field only when it changes. A list you include replaces the old list whole.
+- The map's "facts" holds only the facts seen in the last 30 turns, and "olderFactCount" counts the rest.
 - "factsAdd": new facts. "factsSeen": known facts the new turns rely on again, quoted exactly.
 
 ${RULES}`
@@ -53,11 +57,15 @@ function cap(text: string): string {
   return text.length <= TURN_TEXT_LIMIT ? text : `${text.slice(0, TURN_TEXT_LIMIT)} ... (cut)`
 }
 
-/** The glossary and map as the background model reads them: meanings and items only, no bookkeeping. */
-function currentStateJson(snapshot: Snapshot): string {
+/**
+ * The glossary and map as the background model reads them, kept small: term names without
+ * meanings, the facts seen in the last 30 turns in full and the older ones as a count.
+ */
+function currentStateJson(snapshot: Snapshot, currentTurn: number): string {
   const bearings = snapshot.bearings
+  const recentFacts = (bearings?.facts ?? []).filter(fact => currentTurn - fact.lastSeenTurn < RECENT_TURNS)
   return JSON.stringify({
-    glossary: snapshot.glossary.map(entry => ({ term: entry.term, meaning: entry.meaning })),
+    glossaryTerms: snapshot.glossary.map(entry => entry.term),
     bearings: bearings === null ? null : {
       goal: bearings.goal,
       subGoals: bearings.subGoals,
@@ -65,16 +73,17 @@ function currentStateJson(snapshot: Snapshot): string {
       inProgress: bearings.inProgress,
       expectedNext: bearings.expectedNext,
       openDecisions: bearings.openDecisions,
-      facts: bearings.facts.map(fact => fact.text),
+      facts: recentFacts.map(fact => fact.text),
+      olderFactCount: bearings.facts.length - recentFacts.length,
     },
   })
 }
 
-export function updatePrompt(snapshot: Snapshot, turns: TurnText[]): string {
+export function updatePrompt(snapshot: Snapshot, turns: TurnText[], currentTurn: number): string {
   const turnBlocks = turns.map(turn =>
     `<turn number="${turn.turn}">\n<operator>\n${cap(turn.prompt)}\n</operator>\n<assistant>\n${cap(turn.answer)}\n</assistant>\n</turn>`,
   )
-  return `<current>\n${currentStateJson(snapshot)}\n</current>\n\n<new_turns>\n${turnBlocks.join('\n')}\n</new_turns>\n\nAnswer with the JSON delta only.`
+  return `<current>\n${currentStateJson(snapshot, currentTurn)}\n</current>\n\n<new_turns>\n${turnBlocks.join('\n')}\n</new_turns>\n\nAnswer with the JSON delta only.`
 }
 
 /** One message of the transcript as the rebuild reads it: who wrote it and its text, nothing else. */
@@ -132,8 +141,8 @@ export function transcriptChunks(messages: TranscriptMessage[], limit = REBUILD_
 }
 
 /** One step of a rebuild: the state so far and the next piece of the transcript, answered as a delta. */
-export function rebuildChunkPrompt(snapshot: Snapshot, chunk: string, index: number, total: number): string {
-  return `<current>\n${currentStateJson(snapshot)}\n</current>\n\n<transcript_part number="${index + 1}" of="${total}">\n${chunk}\n</transcript_part>\n\nThis is part ${index + 1} of ${total} of the whole conversation, in order. Answer with the JSON delta only.`
+export function rebuildChunkPrompt(snapshot: Snapshot, chunk: string, index: number, total: number, currentTurn: number): string {
+  return `<current>\n${currentStateJson(snapshot, currentTurn)}\n</current>\n\n<transcript_part number="${index + 1}" of="${total}">\n${chunk}\n</transcript_part>\n\nThis is part ${index + 1} of ${total} of the whole conversation, in order. Answer with the JSON delta only.`
 }
 
 export function btwPrompt(question: string): string {
@@ -165,7 +174,7 @@ export const BTW_FALLBACK_MARK = '(from bearings, not the full conversation)'
 
 export const SCAN_SYSTEM = `You keep a glossary and a map of where the work stands for a person who works in a code repository with an AI assistant, and who often steps away. The conversation has said little so far, so you start the map from the repository itself.
 
-You receive the current glossary and map as JSON, and the repository's own notes: a handoff file, instruction files, the README, recent commits, uncommitted changes and the top-level files. Deduce from them the goal, sub-goals, what is in progress, what is expected next, and facts to hold, and take glossary terms that these files define. Answer with one JSON object and nothing else: a delta in this shape.
+You receive the current glossary's terms (names only) and the map as JSON, and the repository's own notes: a handoff file, instruction files, the README, recent commits, uncommitted changes and the top-level files. Deduce from them the goal, sub-goals, what is in progress, what is expected next, and facts to hold, and take glossary terms that these files define. Answer with one JSON object and nothing else: a delta in this shape.
 
 ${DELTA_SHAPE}
 
@@ -175,9 +184,9 @@ ${DELTA_SHAPE}
 ${RULES}`
 
 /** The scan's one request: the state so far and the repository's sources, each already cut to fit. */
-export function scanPrompt(snapshot: Snapshot, sources: ScanSource[]): string {
+export function scanPrompt(snapshot: Snapshot, sources: ScanSource[], currentTurn: number): string {
   const blocks = sources.map(source =>
     `<source name="${source.name}"${source.isCut === true ? ' cut="true"' : ''}>\n${source.text}\n</source>`,
   )
-  return `<current>\n${currentStateJson(snapshot)}\n</current>\n\n<repo>\n${blocks.join('\n')}\n</repo>\n\nAnswer with the JSON delta only.`
+  return `<current>\n${currentStateJson(snapshot, currentTurn)}\n</current>\n\n<repo>\n${blocks.join('\n')}\n</repo>\n\nAnswer with the JSON delta only.`
 }

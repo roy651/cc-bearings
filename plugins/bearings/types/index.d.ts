@@ -34,6 +34,8 @@ export interface Bearings {
   inheritedFrom?: { sessionId: string; savedAt: string }
   /** Fields whose current content came from a repo scan; an update that sets a field takes it off. */
   repoFields?: BearingsField[]
+  /** The turn each field's content last changed. A field missing here has not changed since this record began. */
+  changedAtTurn?: Partial<Record<BearingsField, number>>
 }
 
 export interface BtwExchange {
@@ -110,6 +112,8 @@ declare module 'claude-code' {
       participation: Participation
       /** The last 20 printed views, oldest first. */
       prints: PrintedView[]
+      /** Terms the operator already knows: hidden from the glossary pane, never pruned. Kept per folder in the store. */
+      knownTerms: string[]
     }
   }
 }

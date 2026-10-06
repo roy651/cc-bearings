@@ -137,7 +137,7 @@ describe('what a scan reads', () => {
     await clock.settle()
 
     const pane = await $.ui.mount({ plugin: 'bearings', surface: 'terminal', component: 'Pane', requestId: 'bearings-map', props: PANE_PROPS })
-    expect(await pane.find({ type: 'Markdown', text: '## Goal\nship the plugin (from repo)' })).toBeDefined()
+    expect(await pane.find({ type: 'Markdown', text: '## Goal (changed this turn)\nship the plugin (from repo)' })).toBeDefined()
   })
 })
 

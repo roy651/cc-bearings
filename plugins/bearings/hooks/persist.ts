@@ -31,6 +31,22 @@ export function bearingsFolder(home: string, cwd: string): string {
   return `${home}/.claude/projects/${cwd.replaceAll('/', '-')}/bearings`
 }
 
+/** `<session id>.failures.log`, beside the session's .json: one line per failed model call. */
+export function failureLogPath(folder: string, sessionId: string): string {
+  return `${folder}/${sessionId}.failures.log`
+}
+
+/** The failure log never grows past this many characters. */
+export const FAILURE_LOG_LIMIT = 64_000
+
+/** The log with `line` added at the end. Past `limit` characters its oldest whole lines are dropped. */
+export function appendBounded(log: string, line: string, limit = FAILURE_LOG_LIMIT): string {
+  const next = `${log}${line}\n`
+  if (next.length <= limit) return next
+  const tail = next.slice(next.length - limit)
+  return tail.slice(tail.indexOf('\n') + 1)
+}
+
 export function firstLine(text: string): string {
   return text.split('\n')[0]?.trim() ?? ''
 }

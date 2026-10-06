@@ -68,9 +68,11 @@ fact: <text>
 pin: <term>
 pin project: <term>
 unpin: <term>
+known: <term>
+unknown: <term>
 ```
 
-`add:` adds or replaces a glossary entry. `fact:` adds a fact to Bearings. `pin:` and `unpin:` take a term or the start of a fact text. Any other line typed in the Glossary pane shows the list of commands. Any other line typed in the Bearings pane is a btw question.
+`add:` adds or replaces a glossary entry. `fact:` adds a fact to Bearings. `pin:` and `unpin:` take a term or the start of a fact text. `known:` marks a term you already know: it stays in the glossary and is still updated, but the Glossary pane hides it behind a count line, and it is never pruned. Known terms are kept per folder. `unknown:` shows the term again. Any other line typed in the Glossary pane shows the list of commands. Any other line typed in the Bearings pane is a btw question.
 
 A btw question is a side question about the conversation. It is answered briefly in the pane and never enters the main conversation. The last 20 are kept.
 
@@ -78,7 +80,7 @@ The Rebuild button in the Bearings pane (hotkey `r`) regenerates the glossary an
 
 You can also ask Claude in the conversation to add a term or a fact. Claude then calls the `add` tool (listed as `mcp__bearings__add`), and the entry appears in the panes.
 
-**Pins and the 30-turn fold.** An entry stays in the main list while it was seen in the last 30 turns. Older entries move to a collapsed "Earlier" section and are never deleted. A pin keeps an entry in the main list. `pin:` holds it for this session, and `pin project:` holds it in every session started in the same folder.
+**Pins and the 30-turn limit.** An entry stays in the main list while it was seen in the last 30 turns. After each background update, terms and facts the background model added that have not been seen for 30 turns are deleted. Pinned entries, entries you or Claude added, and known terms are never deleted. Those that go unseen move to a collapsed "Earlier" section. A pin keeps an entry in the main list. `pin:` holds it for this session, and `pin project:` holds it in every session started in the same folder.
 
 ## Several sessions in one folder
 

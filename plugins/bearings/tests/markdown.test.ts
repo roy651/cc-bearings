@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { PRINTED_VIEW_LIMIT, printedView } from '../hooks/markdown'
+import { bearingsSections, changedAgo, PRINTED_VIEW_LIMIT, printedView } from '../hooks/markdown'
 import { emptyBearings } from '../hooks/merge'
 import type { Snapshot } from '../hooks/merge'
 import { transcriptChunks } from '../hooks/prompts'
@@ -32,4 +32,18 @@ test('the transcript packs into chunks in order, a long message cut across chunk
   expect(chunks.every(chunk => chunk.length <= 100)).toBe(true)
   expect(chunks[0]).toBe(`<operator>\n${'a'.repeat(20)}\n</operator>\n<assistant>\n${'b'.repeat(20)}\n</assistant>`)
   expect(chunks.slice(1).join('')).toBe(`<operator>\n${'c'.repeat(150)}\n</operator>`)
+})
+
+test('with the current turn, a heading whose field recorded a change says how long ago', () => {
+  const bearings = { ...emptyBearings(), goal: 'ship it', inProgress: ['tests'], changedAtTurn: { inProgress: 7 } }
+  const pane = bearingsSections(bearings, [], 10)
+  expect(pane).toContain('## In progress (changed 3 turns ago)\n- tests')
+  expect(pane).toContain('## Goal\nship it')
+  expect(bearingsSections(bearings, [])).toContain('## In progress\n- tests')
+})
+
+test('the change age reads this turn, 1 turn, N turns', () => {
+  expect(changedAgo(5, 5)).toBe('changed this turn')
+  expect(changedAgo(4, 5)).toBe('changed 1 turn ago')
+  expect(changedAgo(1, 5)).toBe('changed 4 turns ago')
 })
